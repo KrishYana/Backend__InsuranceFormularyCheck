@@ -39,6 +39,15 @@ func (FormularyEntry) Fields() []ent.Field {
 		field.Float("coinsurance_pct").
 			Optional().
 			Nillable(),
+		field.Float("copay_mail_order").
+			Optional().
+			Nillable(),
+		field.Bool("is_covered").
+			Default(true),
+		field.Bool("specialty_drug").
+			Default(false),
+		field.String("quantity_limit_detail").
+			Optional(),
 		field.String("source_type").
 			NotEmpty(),
 		field.Time("source_date"),
@@ -61,6 +70,7 @@ func (FormularyEntry) Edges() []ent.Edge {
 			Ref("formulary_entries").
 			Unique().
 			Required(),
+		edge.To("prior_auth_criteria", PriorAuthCriteria.Type),
 	}
 }
 
@@ -68,6 +78,7 @@ func (FormularyEntry) Edges() []ent.Edge {
 func (FormularyEntry) Indexes() []ent.Index {
 	return []ent.Index{
 		index.Fields("is_current"),
+		index.Fields("is_covered"),
 		index.Fields("source_type"),
 	}
 }

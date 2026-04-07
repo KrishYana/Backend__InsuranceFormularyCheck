@@ -33,6 +33,18 @@ func (Plan) Fields() []ent.Field {
 			Optional(),
 		field.String("snp_type").
 			Optional(),
+		field.String("state_code").
+			Optional().
+			MaxLen(2),
+		field.String("market_type").
+			Optional(),
+		field.String("metal_level").
+			Optional(),
+		field.Int("plan_year").
+			Optional().
+			Nillable(),
+		field.Bool("is_active").
+			Default(true),
 		field.Time("created_at").
 			Default(time.Now).
 			Immutable(),
@@ -45,7 +57,12 @@ func (Plan) Fields() []ent.Field {
 // Edges of the Plan.
 func (Plan) Edges() []ent.Edge {
 	return []ent.Edge{
+		edge.From("insurer", Insurer.Type).
+			Ref("plans").
+			Unique(),
 		edge.To("formulary_entries", FormularyEntry.Type),
+		edge.To("saved_lookups_for_plan", SavedLookup.Type),
+		edge.To("search_history_plans", SearchHistory.Type),
 	}
 }
 
@@ -55,5 +72,7 @@ func (Plan) Indexes() []ent.Index {
 		index.Fields("contract_id", "plan_id", "segment_id").
 			Unique(),
 		index.Fields("formulary_id"),
+		index.Fields("state_code"),
+		index.Fields("is_active"),
 	}
 }

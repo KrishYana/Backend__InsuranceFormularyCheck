@@ -56,6 +56,12 @@ func (Drug) Edges() []ent.Edge {
 	return []ent.Edge{
 		edge.To("ndc_mappings", DrugNdcMap.Type),
 		edge.To("formulary_entries", FormularyEntry.Type),
+		edge.To("saved_lookups_for_drug", SavedLookup.Type),
+		edge.To("search_history_drugs", SearchHistory.Type),
+		edge.From("alternatives", DrugAlternative.Type).
+			Ref("drug"),
+		edge.From("alternative_of", DrugAlternative.Type).
+			Ref("alternative_drug"),
 	}
 }
 
