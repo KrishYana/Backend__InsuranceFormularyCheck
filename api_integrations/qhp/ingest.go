@@ -69,20 +69,33 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 	results := ing.crawlAll(ctx, staleIssuers)
 
 	// Process results
-	var success, failed int
+	var success, failed, crawlFailed, noPlans, noDrugs int
 	for _, result := range results {
 		if result.Err != nil {
-			failed++
-			if failed <= 20 {
-				log.Printf("FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, result.Err)
+			crawlFailed++
+			if crawlFailed <= 10 {
+				log.Printf("CRAWL FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, result.Err)
 			}
+			failed++
 			continue
 		}
 
+		if len(result.Plans) == 0 {
+			noPlans++
+			continue
+		}
+
+		log.Printf("  PROCESS [%s] %s: %d plans, %d drugs",
+			result.Issuer.State, result.Issuer.IssuerID, len(result.Plans), len(result.Drugs))
+
 		if err := ing.processResult(ctx, result); err != nil {
 			failed++
-			log.Printf("FAIL [%s] %s: process: %v", result.Issuer.State, result.Issuer.IssuerID, err)
+			log.Printf("PROCESS FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, err)
 			continue
+		}
+
+		if len(result.Drugs) == 0 {
+			noDrugs++
 		}
 
 		// Record per-issuer sync time
@@ -100,7 +113,8 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		log.Printf("QHP: WARN: failed to record overall sync metadata: %v", err)
 	}
 
-	log.Printf("QHP ingestion complete. %d success, %d failed out of %d issuers.", success, failed, len(staleIssuers))
+	log.Printf("QHP ingestion complete. %d success, %d failed (%d crawl errors, %d no plans, %d no drugs) out of %d issuers.",
+		success, failed, crawlFailed, noPlans, noDrugs, len(staleIssuers))
 	return nil
 }
 

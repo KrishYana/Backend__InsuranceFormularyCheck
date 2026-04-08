@@ -44,9 +44,14 @@ func parseIssuerCSV(r io.Reader) ([]Issuer, error) {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
 
+	// Normalize headers: uppercase, strip spaces and underscores for flexible matching
 	colIndex := make(map[string]int)
 	for i, col := range header {
-		colIndex[strings.TrimSpace(strings.ToUpper(col))] = i
+		normalized := strings.TrimSpace(strings.ToUpper(col))
+		colIndex[normalized] = i
+		// Also store with underscores replaced by spaces and vice versa
+		colIndex[strings.ReplaceAll(normalized, " ", "_")] = i
+		colIndex[strings.ReplaceAll(normalized, "_", " ")] = i
 	}
 
 	var issuers []Issuer
@@ -59,16 +64,33 @@ func parseIssuerCSV(r io.Reader) ([]Issuer, error) {
 			continue
 		}
 
+		// Try both naming conventions for the URL column
 		url := getCSVCol(record, colIndex, "MR_URL_SUBMITTED")
+		if url == "" {
+			url = getCSVCol(record, colIndex, "URL_SUBMITTED")
+		}
+		if url == "" {
+			url = getCSVCol(record, colIndex, "URL SUBMITTED")
+		}
 		if url == "" {
 			continue
 		}
 
+		state := getCSVCol(record, colIndex, "STATE")
+		issuerID := getCSVCol(record, colIndex, "ISSUER_ID")
+		if issuerID == "" {
+			issuerID = getCSVCol(record, colIndex, "ISSUER ID")
+		}
+		email := getCSVCol(record, colIndex, "TECH_POC_EMAIL")
+		if email == "" {
+			email = getCSVCol(record, colIndex, "TECH POC EMAIL")
+		}
+
 		issuers = append(issuers, Issuer{
-			State:    getCSVCol(record, colIndex, "STATE"),
-			IssuerID: getCSVCol(record, colIndex, "ISSUER_ID"),
+			State:    state,
+			IssuerID: issuerID,
 			URL:      url,
-			Email:    getCSVCol(record, colIndex, "TECH_POC_EMAIL"),
+			Email:    email,
 		})
 	}
 
