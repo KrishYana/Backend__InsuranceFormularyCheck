@@ -10,16 +10,25 @@ import (
 
 	"github.com/kyanaman/formularycheck/ent"
 	"github.com/kyanaman/formularycheck/ent/drug"
+	"github.com/kyanaman/formularycheck/ent/formularyentry"
 	"github.com/kyanaman/formularycheck/ent/plan"
+	"github.com/kyanaman/formularycheck/internal/synctracker"
 )
 
-const concurrentCrawls = 10
+const (
+	concurrentCrawls = 10
+	sourceName       = "qhp"
+	// issuerStaleAfter defines how long before an issuer is re-crawled.
+	// QHP data typically updates quarterly, so 7 days is a reasonable interval.
+	issuerStaleAfter = 7 * 24 * time.Hour
+)
 
 // Ingestor discovers QHP issuers and ingests their formulary data.
 type Ingestor struct {
-	db      *ent.Client
-	crawler *Crawler
+	db       *ent.Client
+	crawler  *Crawler
 	mrpufURL string
+	tracker  *synctracker.Tracker
 }
 
 // NewIngestor creates a new QHP ingestor.
@@ -28,20 +37,35 @@ func NewIngestor(db *ent.Client, mrpufURL string) *Ingestor {
 		db:       db,
 		crawler:  NewCrawler(),
 		mrpufURL: mrpufURL,
+		tracker:  synctracker.New(db),
 	}
 }
 
 // Run discovers issuers, crawls their JSON files, and upserts data.
+// On subsequent runs, only re-crawls issuers that haven't been synced recently.
+// Per-issuer sync times are tracked in SyncMetadata with source_name "qhp:<issuer_id>".
 func (ing *Ingestor) Run(ctx context.Context) error {
 	issuers, err := DiscoverIssuers(ctx, ing.mrpufURL)
 	if err != nil {
 		return fmt.Errorf("discover issuers: %w", err)
 	}
 
-	log.Printf("Crawling %d issuers (%d concurrent)...", len(issuers), concurrentCrawls)
+	// Filter to only stale issuers (those not synced within issuerStaleAfter)
+	staleIssuers, skippedCount := ing.filterStaleIssuers(ctx, issuers)
 
-	// Crawl issuers concurrently
-	results := ing.crawlAll(ctx, issuers)
+	if skippedCount > 0 {
+		log.Printf("QHP: %d issuers recently synced (skipped). %d stale issuers to crawl.", skippedCount, len(staleIssuers))
+	}
+
+	if len(staleIssuers) == 0 {
+		log.Println("QHP: all issuers are up to date. Nothing to crawl.")
+		return nil
+	}
+
+	log.Printf("Crawling %d issuers (%d concurrent)...", len(staleIssuers), concurrentCrawls)
+
+	// Crawl stale issuers concurrently
+	results := ing.crawlAll(ctx, staleIssuers)
 
 	// Process results
 	var success, failed int
@@ -60,11 +84,47 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 			continue
 		}
 
+		// Record per-issuer sync time
+		issuerSource := "qhp:" + result.Issuer.IssuerID
+		drugCount := len(result.Drugs)
+		if err := ing.tracker.RecordSync(ctx, issuerSource, drugCount, "", result.Issuer.URL); err != nil {
+			log.Printf("QHP: WARN: failed to record sync for issuer %s: %v", result.Issuer.IssuerID, err)
+		}
+
 		success++
 	}
 
-	log.Printf("QHP ingestion complete. %d success, %d failed out of %d issuers.", success, failed, len(issuers))
+	// Record overall QHP sync
+	if err := ing.tracker.RecordSync(ctx, sourceName, success, "", ing.mrpufURL); err != nil {
+		log.Printf("QHP: WARN: failed to record overall sync metadata: %v", err)
+	}
+
+	log.Printf("QHP ingestion complete. %d success, %d failed out of %d issuers.", success, failed, len(staleIssuers))
 	return nil
+}
+
+// filterStaleIssuers returns only issuers whose last sync is older than issuerStaleAfter.
+func (ing *Ingestor) filterStaleIssuers(ctx context.Context, issuers []Issuer) (stale []Issuer, skipped int) {
+	staleThreshold := time.Now().Add(-issuerStaleAfter)
+
+	for _, issuer := range issuers {
+		issuerSource := "qhp:" + issuer.IssuerID
+		lastSync, err := ing.tracker.GetLastSync(ctx, issuerSource)
+		if err != nil {
+			// On error, include it to be safe
+			stale = append(stale, issuer)
+			continue
+		}
+
+		if lastSync != nil && lastSync.LastSyncAt.After(staleThreshold) {
+			skipped++
+			continue
+		}
+
+		stale = append(stale, issuer)
+	}
+
+	return stale, skipped
 }
 
 func (ing *Ingestor) crawlAll(ctx context.Context, issuers []Issuer) []*CrawlResult {
@@ -92,7 +152,7 @@ func (ing *Ingestor) crawlAll(ctx context.Context, issuers []Issuer) []*CrawlRes
 }
 
 func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) error {
-	// Build a map of plan_id → plan entity for this issuer
+	// Build a map of plan_id -> plan entity for this issuer
 	planMap := make(map[string]*ent.Plan)
 
 	for _, p := range result.Plans {
@@ -161,6 +221,21 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 				continue
 			}
 
+			// Check if entry already exists for this plan+drug+source
+			exists, err := ing.db.FormularyEntry.Query().
+				Where(
+					formularyentry.HasPlanWith(plan.ID(planEnt.ID)),
+					formularyentry.HasDrugWith(drug.ID(drugEnt.ID)),
+					formularyentry.SourceType("QHP"),
+				).
+				Exist(ctx)
+			if err != nil {
+				continue
+			}
+			if exists {
+				continue // skip duplicate
+			}
+
 			tierLevel := TierMapping[strings.ToUpper(dp.DrugTier)]
 			tierName := dp.DrugTier
 
@@ -177,9 +252,6 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 				SetIsCurrent(true)
 
 			if _, err := builder.Save(ctx); err != nil {
-				if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
-					continue
-				}
 				continue
 			}
 			mapped++

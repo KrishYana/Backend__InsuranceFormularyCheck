@@ -103,3 +103,16 @@ func (c *Client) GetAllRelated(ctx context.Context, rxcui string) ([]ConceptGrou
 	}
 	return resp.AllRelatedGroup.ConceptGroup, nil
 }
+
+// GetNewConcepts fetches concepts added to RxNorm since the given date.
+// Uses /REST/version/newConcepts.json?type=all endpoint.
+// The date format expected by RxNorm is MMDDYYYY.
+func (c *Client) GetNewConcepts(ctx context.Context, since time.Time) ([]MinConcept, error) {
+	dateStr := since.Format("01022006") // MMDDYYYY
+	var resp AllConceptsResponse
+	path := fmt.Sprintf("/REST/version/newConcepts.json?type=all&startDate=%s", dateStr)
+	if err := c.get(ctx, path, &resp); err != nil {
+		return nil, fmt.Errorf("get new concepts since %s: %w", dateStr, err)
+	}
+	return resp.MinConceptGroup.MinConcept, nil
+}

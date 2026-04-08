@@ -26,6 +26,45 @@ func NewBulkDownloader() *BulkDownloader {
 	}
 }
 
+// CheckLastModified sends a HEAD request to the bulk download metadata endpoint
+// and returns the Last-Modified header value. This can be compared against the
+// stored value from the previous sync to determine if a re-download is needed.
+func (b *BulkDownloader) CheckLastModified(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, bulkDownloadURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create HEAD request: %w", err)
+	}
+
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("HEAD request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusMethodNotAllowed {
+		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	// Try Last-Modified first, fall back to ETag
+	lastModified := resp.Header.Get("Last-Modified")
+	if lastModified != "" {
+		return lastModified, nil
+	}
+
+	etag := resp.Header.Get("ETag")
+	if etag != "" {
+		return etag, nil
+	}
+
+	// If neither header is available, return content-length as a rough proxy
+	contentLength := resp.Header.Get("Content-Length")
+	if contentLength != "" {
+		return "size:" + contentLength, nil
+	}
+
+	return "", fmt.Errorf("no Last-Modified, ETag, or Content-Length header available")
+}
+
 // FetchAllNDCRecords downloads all NDC partitions and returns parsed records.
 func (b *BulkDownloader) FetchAllNDCRecords(ctx context.Context) ([]NDCRecord, error) {
 	partitions, err := b.getPartitions(ctx)
