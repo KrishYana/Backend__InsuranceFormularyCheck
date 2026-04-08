@@ -128,6 +128,12 @@ func (h *Handler) GetCoverageMulti(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Record search history for each plan in the multi-lookup
+	for _, pid := range planIDs {
+		pidCopy := pid
+		h.recordSearchHistory(r, "", len(entries), &pidCopy, &drugID)
+	}
+
 	result := make([]dto.FormularyEntryDTO, len(entries))
 	for i, e := range entries {
 		result[i] = dto.FormularyEntryFromEnt(e)
