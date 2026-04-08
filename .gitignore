@@ -12,6 +12,13 @@ bin/
 *.swp
 *.swo
 
+# Logs & temp files
+*.log
+*.tmp
+
+# Go vendor directory
+vendor/
+
 # OS
 .DS_Store
 Thumbs.db
