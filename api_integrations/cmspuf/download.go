@@ -41,6 +41,40 @@ type ExtractedFiles struct {
 	BenefitCost    []byte
 }
 
+// CheckFingerprint sends a HEAD request to the PUF URL and returns a fingerprint
+// string (Last-Modified, ETag, or Content-Length) that can be compared across runs
+// to avoid re-downloading the ~2.3GB ZIP if unchanged.
+func (d *Downloader) CheckFingerprint(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, d.url, nil)
+	if err != nil {
+		return "", fmt.Errorf("create HEAD request: %w", err)
+	}
+
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("HEAD request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Some CDNs don't support HEAD, fall back gracefully
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusMethodNotAllowed {
+		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	// Try Last-Modified first, then ETag, then Content-Length
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		return lm, nil
+	}
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		return etag, nil
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		return "size:" + cl, nil
+	}
+
+	return "", fmt.Errorf("no Last-Modified, ETag, or Content-Length header available")
+}
+
 // Download fetches the PUF ZIP and extracts only the target inner ZIPs.
 func (d *Downloader) Download(ctx context.Context) (*ExtractedFiles, error) {
 	log.Printf("Downloading PUF from %s...", d.url)

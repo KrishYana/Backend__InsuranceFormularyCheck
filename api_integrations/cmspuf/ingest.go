@@ -10,14 +10,20 @@ import (
 	"github.com/kyanaman/formularycheck/ent/drug"
 	"github.com/kyanaman/formularycheck/ent/formularyentry"
 	"github.com/kyanaman/formularycheck/ent/plan"
+	"github.com/kyanaman/formularycheck/internal/synctracker"
 )
 
-const batchSize = 1000
+const (
+	batchSize  = 1000
+	sourceName = "cms_puf"
+)
 
 // Ingestor downloads and ingests CMS Part D PUF data.
 type Ingestor struct {
 	db         *ent.Client
 	downloader *Downloader
+	tracker    *synctracker.Tracker
+	pufURL     string
 }
 
 // NewIngestor creates a new CMS PUF ingestor.
@@ -26,11 +32,32 @@ func NewIngestor(db *ent.Client, pufURL string) *Ingestor {
 	return &Ingestor{
 		db:         db,
 		downloader: NewDownloader(pufURL),
+		tracker:    synctracker.New(db),
+		pufURL:     pufURL,
 	}
 }
 
 // Run downloads the PUF, parses all files, and upserts data into the database.
+// On subsequent runs, it first sends a HEAD request to check if the file has
+// changed since the last sync (via Last-Modified or Content-Length comparison).
 func (ing *Ingestor) Run(ctx context.Context) error {
+	// Check if data has changed since last sync
+	lastSync, err := ing.tracker.GetLastSync(ctx, sourceName)
+	if err != nil {
+		return fmt.Errorf("get last sync: %w", err)
+	}
+
+	fingerprint, err := ing.downloader.CheckFingerprint(ctx)
+	if err != nil {
+		log.Printf("CMS PUF: WARN: could not check file fingerprint, proceeding with full download: %v", err)
+	} else if lastSync != nil && lastSync.LastEtag != "" {
+		if fingerprint == lastSync.LastEtag {
+			log.Printf("CMS PUF: file unchanged since last sync (fingerprint: %s). Skipping download.", fingerprint)
+			return nil
+		}
+		log.Printf("CMS PUF: file changed (was: %s, now: %s). Downloading...", lastSync.LastEtag, fingerprint)
+	}
+
 	// Download and extract
 	files, err := ing.downloader.Download(ctx)
 	if err != nil {
@@ -42,15 +69,22 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		return fmt.Errorf("ingest plans: %w", err)
 	}
 
-	// Step 2: Build formulary_id → plan_id lookup
+	// Step 2: Build formulary_id -> plan_id lookup
 	formularyToPlan, err := ing.buildFormularyPlanMap(ctx)
 	if err != nil {
 		return fmt.Errorf("build formulary map: %w", err)
 	}
 
 	// Step 3: Parse and upsert formulary entries
-	if err := ing.ingestFormulary(ctx, files.FormularyDrugs, formularyToPlan); err != nil {
+	totalMapped, err := ing.ingestFormulary(ctx, files.FormularyDrugs, formularyToPlan)
+	if err != nil {
 		return fmt.Errorf("ingest formulary: %w", err)
+	}
+
+	// Record sync metadata
+	etag := fingerprint
+	if err := ing.tracker.RecordSync(ctx, sourceName, totalMapped, etag, ing.pufURL); err != nil {
+		log.Printf("CMS PUF: WARN: failed to record sync metadata: %v", err)
 	}
 
 	log.Println("CMS PUF ingestion complete.")
@@ -133,7 +167,7 @@ func (ing *Ingestor) buildFormularyPlanMap(ctx context.Context) (map[string][]in
 	return result, nil
 }
 
-func (ing *Ingestor) ingestFormulary(ctx context.Context, data []byte, formularyToPlan map[string][]int) error {
+func (ing *Ingestor) ingestFormulary(ctx context.Context, data []byte, formularyToPlan map[string][]int) (int, error) {
 	log.Println("Parsing Basic Drugs Formulary file...")
 
 	sourceDate := time.Now()
@@ -224,10 +258,10 @@ func (ing *Ingestor) ingestFormulary(ctx context.Context, data []byte, formulary
 	})
 
 	if err != nil {
-		return err
+		return mapped, err
 	}
 
 	log.Printf("Formulary done. %d processed, %d mapped, %d no drug, %d no plan, %d errors",
 		totalProcessed, mapped, noDrug, noPlan, errors)
-	return nil
+	return mapped, nil
 }

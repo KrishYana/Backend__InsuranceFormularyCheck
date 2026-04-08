@@ -10,12 +10,16 @@ import (
 	"github.com/kyanaman/formularycheck/ent"
 	"github.com/kyanaman/formularycheck/ent/drug"
 	"github.com/kyanaman/formularycheck/ent/drugndcmap"
+	"github.com/kyanaman/formularycheck/internal/synctracker"
 )
+
+const sourceName = "openfda"
 
 // Ingestor downloads NDC data from openFDA and maps it to drugs in the database.
 type Ingestor struct {
 	db         *ent.Client
 	downloader *BulkDownloader
+	tracker    *synctracker.Tracker
 }
 
 // NewIngestor creates a new openFDA ingestor.
@@ -23,11 +27,32 @@ func NewIngestor(db *ent.Client) *Ingestor {
 	return &Ingestor{
 		db:         db,
 		downloader: NewBulkDownloader(),
+		tracker:    synctracker.New(db),
 	}
 }
 
 // Run downloads the full NDC dataset and upserts NDC-to-drug mappings.
+// On subsequent runs, it first checks the bulk metadata endpoint via HEAD
+// request to see if the data has changed since the last sync.
 func (ing *Ingestor) Run(ctx context.Context) error {
+	// Check if data has changed since last sync
+	lastSync, err := ing.tracker.GetLastSync(ctx, sourceName)
+	if err != nil {
+		return fmt.Errorf("get last sync: %w", err)
+	}
+
+	lastModified, err := ing.downloader.CheckLastModified(ctx)
+	if err != nil {
+		log.Printf("openFDA: WARN: could not check last-modified, proceeding with full download: %v", err)
+	} else if lastSync != nil && lastSync.LastEtag != "" {
+		// Compare stored last-modified with current
+		if lastModified == lastSync.LastEtag {
+			log.Printf("openFDA: bulk data unchanged since last sync (Last-Modified: %s). Skipping download.", lastModified)
+			return nil
+		}
+		log.Printf("openFDA: data changed (was: %s, now: %s). Downloading...", lastSync.LastEtag, lastModified)
+	}
+
 	log.Println("Starting openFDA NDC bulk download...")
 
 	records, err := ing.downloader.FetchAllNDCRecords(ctx)
@@ -37,10 +62,11 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 
 	log.Printf("Downloaded %d NDC records. Mapping to drugs...", len(records))
 
-	var mapped, noRxCUI, noDrug, errors int
+	var mapped, updated, noRxCUI, noDrug, errors int
 
 	for i, record := range records {
-		if err := ing.processRecord(ctx, record); err != nil {
+		result, err := ing.processRecord(ctx, record)
+		if err != nil {
 			switch {
 			case isNoRxCUI(err):
 				noRxCUI++
@@ -55,22 +81,42 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 			continue
 		}
 
-		mapped++
+		switch result {
+		case processResultCreated:
+			mapped++
+		case processResultUpdated:
+			updated++
+		}
+
 		if (i+1)%5000 == 0 {
-			log.Printf("Progress: %d/%d processed (%d mapped, %d no rxcui, %d no drug match, %d errors)",
-				i+1, len(records), mapped, noRxCUI, noDrug, errors)
+			log.Printf("Progress: %d/%d processed (%d mapped, %d updated, %d no rxcui, %d no drug match, %d errors)",
+				i+1, len(records), mapped, updated, noRxCUI, noDrug, errors)
 		}
 	}
 
-	log.Printf("Done. %d mapped, %d no rxcui, %d no drug match, %d errors out of %d total.",
-		mapped, noRxCUI, noDrug, errors, len(records))
+	log.Printf("Done. %d mapped, %d updated, %d no rxcui, %d no drug match, %d errors out of %d total.",
+		mapped, updated, noRxCUI, noDrug, errors, len(records))
+
+	// Record sync metadata
+	etag := lastModified
+	if err := ing.tracker.RecordSync(ctx, sourceName, mapped+updated, etag, bulkDownloadURL); err != nil {
+		log.Printf("openFDA: WARN: failed to record sync metadata: %v", err)
+	}
+
 	return nil
 }
 
-func (ing *Ingestor) processRecord(ctx context.Context, record NDCRecord) error {
+type processResultType int
+
+const (
+	processResultCreated processResultType = iota
+	processResultUpdated
+)
+
+func (ing *Ingestor) processRecord(ctx context.Context, record NDCRecord) (processResultType, error) {
 	// Need at least one rxcui to map
 	if len(record.OpenFDA.RxCUI) == 0 {
-		return errNoRxCUI
+		return 0, errNoRxCUI
 	}
 
 	// Find matching drug by rxcui
@@ -80,9 +126,9 @@ func (ing *Ingestor) processRecord(ctx context.Context, record NDCRecord) error 
 		Only(ctx)
 	if err != nil {
 		if ent.IsNotFound(err) {
-			return errNoDrug
+			return 0, errNoDrug
 		}
-		return fmt.Errorf("query drug for rxcui %s: %w", rxcui, err)
+		return 0, fmt.Errorf("query drug for rxcui %s: %w", rxcui, err)
 	}
 
 	// Determine manufacturer
@@ -94,22 +140,12 @@ func (ing *Ingestor) processRecord(ctx context.Context, record NDCRecord) error 
 	// Parse dates
 	startDate := parseOpenFDADate(record.MarketingStartDate)
 
+	var anyCreated, anyUpdated bool
+
 	// Process each package NDC
 	for _, pkg := range record.Packaging {
 		ndc := normalizeNDC(pkg.PackageNDC)
 		if ndc == "" {
-			continue
-		}
-
-		// Upsert: check if NDC already exists
-		exists, err := ing.db.DrugNdcMap.Query().
-			Where(drugndcmap.Ndc(ndc)).
-			Exist(ctx)
-		if err != nil {
-			return fmt.Errorf("check ndc %s: %w", ndc, err)
-		}
-
-		if exists {
 			continue
 		}
 
@@ -119,29 +155,74 @@ func (ing *Ingestor) processRecord(ctx context.Context, record NDCRecord) error 
 			status = "DISCONTINUED"
 		}
 
-		builder := ing.db.DrugNdcMap.Create().
-			SetNdc(ndc).
-			SetNdcStatus(status).
-			SetManufacturer(manufacturer).
-			SetPackageDescription(pkg.Description).
-			SetDrug(drugEnt)
+		// Check if NDC already exists
+		existing, err := ing.db.DrugNdcMap.Query().
+			Where(drugndcmap.Ndc(ndc)).
+			Only(ctx)
 
-		if startDate != nil {
-			builder = builder.SetStartDate(*startDate)
-		}
-		if endDate != nil {
-			builder = builder.SetEndDate(*endDate)
-		}
+		if ent.IsNotFound(err) {
+			// Create new mapping
+			builder := ing.db.DrugNdcMap.Create().
+				SetNdc(ndc).
+				SetNdcStatus(status).
+				SetManufacturer(manufacturer).
+				SetPackageDescription(pkg.Description).
+				SetDrug(drugEnt)
 
-		if _, err := builder.Save(ctx); err != nil {
-			if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
-				continue
+			if startDate != nil {
+				builder = builder.SetStartDate(*startDate)
 			}
-			return fmt.Errorf("create ndc mapping %s: %w", ndc, err)
+			if endDate != nil {
+				builder = builder.SetEndDate(*endDate)
+			}
+
+			if _, err := builder.Save(ctx); err != nil {
+				if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+					continue
+				}
+				return 0, fmt.Errorf("create ndc mapping %s: %w", ndc, err)
+			}
+			anyCreated = true
+		} else if err != nil {
+			return 0, fmt.Errorf("query ndc %s: %w", ndc, err)
+		} else {
+			// Update existing mapping if data has changed
+			needsUpdate := false
+			updater := existing.Update()
+
+			if existing.NdcStatus != status {
+				updater = updater.SetNdcStatus(status)
+				needsUpdate = true
+			}
+			if manufacturer != "" && existing.Manufacturer != manufacturer {
+				updater = updater.SetManufacturer(manufacturer)
+				needsUpdate = true
+			}
+			if pkg.Description != "" && existing.PackageDescription != pkg.Description {
+				updater = updater.SetPackageDescription(pkg.Description)
+				needsUpdate = true
+			}
+			if endDate != nil && (existing.EndDate == nil || !existing.EndDate.Equal(*endDate)) {
+				updater = updater.SetEndDate(*endDate)
+				needsUpdate = true
+			}
+
+			if needsUpdate {
+				if _, err := updater.Save(ctx); err != nil {
+					return 0, fmt.Errorf("update ndc mapping %s: %w", ndc, err)
+				}
+				anyUpdated = true
+			}
 		}
 	}
 
-	return nil
+	if anyCreated {
+		return processResultCreated, nil
+	}
+	if anyUpdated {
+		return processResultUpdated, nil
+	}
+	return processResultCreated, nil
 }
 
 // normalizeNDC converts a dashed NDC (e.g., "0069-0730-01") to an 11-digit format.
