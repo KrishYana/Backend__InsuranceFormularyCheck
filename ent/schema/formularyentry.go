@@ -80,5 +80,9 @@ func (FormularyEntry) Indexes() []ent.Index {
 		index.Fields("is_current"),
 		index.Fields("is_covered"),
 		index.Fields("source_type"),
+		// Prevent duplicate entries: one entry per plan+drug+source
+		index.Fields("source_type").
+			Edges("plan", "drug").
+			Unique(),
 	}
 }

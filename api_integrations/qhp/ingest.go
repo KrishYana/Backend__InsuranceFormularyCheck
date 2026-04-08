@@ -10,6 +10,7 @@ import (
 
 	"github.com/kyanaman/formularycheck/ent"
 	"github.com/kyanaman/formularycheck/ent/drug"
+	"github.com/kyanaman/formularycheck/ent/formularyentry"
 	"github.com/kyanaman/formularycheck/ent/plan"
 )
 
@@ -161,6 +162,21 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 				continue
 			}
 
+			// Check if entry already exists for this plan+drug+source
+			exists, err := ing.db.FormularyEntry.Query().
+				Where(
+					formularyentry.HasPlanWith(plan.ID(planEnt.ID)),
+					formularyentry.HasDrugWith(drug.ID(drugEnt.ID)),
+					formularyentry.SourceType("QHP"),
+				).
+				Exist(ctx)
+			if err != nil {
+				continue
+			}
+			if exists {
+				continue // skip duplicate
+			}
+
 			tierLevel := TierMapping[strings.ToUpper(dp.DrugTier)]
 			tierName := dp.DrugTier
 
@@ -177,9 +193,6 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 				SetIsCurrent(true)
 
 			if _, err := builder.Save(ctx); err != nil {
-				if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
-					continue
-				}
 				continue
 			}
 			mapped++

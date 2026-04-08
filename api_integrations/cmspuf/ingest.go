@@ -8,6 +8,7 @@ import (
 
 	"github.com/kyanaman/formularycheck/ent"
 	"github.com/kyanaman/formularycheck/ent/drug"
+	"github.com/kyanaman/formularycheck/ent/formularyentry"
 	"github.com/kyanaman/formularycheck/ent/plan"
 )
 
@@ -171,6 +172,22 @@ func (ing *Ingestor) ingestFormulary(ctx context.Context, data []byte, formulary
 			tierName := TierName[row.TierLevelValue]
 
 			for _, planID := range planIDs {
+				// Check if entry already exists for this plan+drug+source
+				exists, err := ing.db.FormularyEntry.Query().
+					Where(
+						formularyentry.HasPlanWith(plan.ID(planID)),
+						formularyentry.HasDrugWith(drug.ID(drugEnt.ID)),
+						formularyentry.SourceType("CMS_PUF"),
+					).
+					Exist(ctx)
+				if err != nil {
+					errors++
+					continue
+				}
+				if exists {
+					continue // skip duplicate
+				}
+
 				builder := ing.db.FormularyEntry.Create().
 					SetPlanID(planID).
 					SetDrugID(drugEnt.ID).
