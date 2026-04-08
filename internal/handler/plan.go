@@ -20,10 +20,15 @@ func (h *Handler) GetInsurers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Include plans with matching state_code OR NULL state_code (national plans like Medicare Part D)
 	insurers, err := h.db.Insurer.Query().
-		Where(insurer.HasPlansWith(plan.StateCode(code), plan.IsActive(true))).
+		Where(insurer.HasPlansWith(
+			plan.Or(plan.StateCode(code), plan.StateCodeIsNil()),
+			plan.IsActive(true),
+		)).
 		WithPlans(func(q *ent.PlanQuery) {
-			q.Where(plan.StateCode(code), plan.IsActive(true))
+			q.Where(plan.Or(plan.StateCode(code), plan.StateCodeIsNil()), plan.IsActive(true)).
+				Limit(50)
 		}).
 		All(r.Context())
 	if err != nil {
@@ -56,7 +61,7 @@ func (h *Handler) GetPlans(w http.ResponseWriter, r *http.Request) {
 		WithInsurer()
 
 	if stateCode != "" {
-		query = query.Where(plan.StateCode(stateCode))
+		query = query.Where(plan.Or(plan.StateCode(stateCode), plan.StateCodeIsNil()))
 	}
 
 	plans, err := query.All(r.Context())

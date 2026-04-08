@@ -31,6 +31,7 @@ func (h *Handler) SearchDrugs(w http.ResponseWriter, r *http.Request) {
 			drug.Or(
 				drug.DrugNameContainsFold(query),
 				drug.GenericNameContainsFold(query),
+				drug.DrugClassContainsFold(query),
 			),
 		).
 		Limit(30).
