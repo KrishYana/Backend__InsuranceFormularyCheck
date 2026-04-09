@@ -11,6 +11,7 @@ import (
 	"github.com/kyanaman/formularycheck/ent"
 	"github.com/kyanaman/formularycheck/ent/drug"
 	"github.com/kyanaman/formularycheck/ent/formularyentry"
+	"github.com/kyanaman/formularycheck/ent/insurer"
 	"github.com/kyanaman/formularycheck/ent/plan"
 	"github.com/kyanaman/formularycheck/internal/synctracker"
 )
@@ -68,20 +69,33 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 	results := ing.crawlAll(ctx, staleIssuers)
 
 	// Process results
-	var success, failed int
+	var success, failed, crawlFailed, noPlans, noDrugs int
 	for _, result := range results {
 		if result.Err != nil {
-			failed++
-			if failed <= 20 {
-				log.Printf("FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, result.Err)
+			crawlFailed++
+			if crawlFailed <= 10 {
+				log.Printf("CRAWL FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, result.Err)
 			}
+			failed++
 			continue
 		}
 
+		if len(result.Plans) == 0 {
+			noPlans++
+			continue
+		}
+
+		log.Printf("  PROCESS [%s] %s: %d plans, %d drugs",
+			result.Issuer.State, result.Issuer.IssuerID, len(result.Plans), len(result.Drugs))
+
 		if err := ing.processResult(ctx, result); err != nil {
 			failed++
-			log.Printf("FAIL [%s] %s: process: %v", result.Issuer.State, result.Issuer.IssuerID, err)
+			log.Printf("PROCESS FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, err)
 			continue
+		}
+
+		if len(result.Drugs) == 0 {
+			noDrugs++
 		}
 
 		// Record per-issuer sync time
@@ -99,7 +113,8 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		log.Printf("QHP: WARN: failed to record overall sync metadata: %v", err)
 	}
 
-	log.Printf("QHP ingestion complete. %d success, %d failed out of %d issuers.", success, failed, len(staleIssuers))
+	log.Printf("QHP ingestion complete. %d success, %d failed (%d crawl errors, %d no plans, %d no drugs) out of %d issuers.",
+		success, failed, crawlFailed, noPlans, noDrugs, len(staleIssuers))
 	return nil
 }
 
@@ -152,6 +167,38 @@ func (ing *Ingestor) crawlAll(ctx context.Context, issuers []Issuer) []*CrawlRes
 }
 
 func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) error {
+	// Find or create an Insurer for this issuer
+	var insurerEnt *ent.Insurer
+	existing, err := ing.db.Insurer.Query().
+		Where(insurer.HiosIssuerID(result.Issuer.IssuerID)).
+		Only(ctx)
+	if err == nil {
+		insurerEnt = existing
+	} else if ent.IsNotFound(err) {
+		// Derive a human-readable name from the first plan's marketing name
+		insurerName := result.Issuer.IssuerID
+		if len(result.Plans) > 0 && result.Plans[0].MarketingName != "" {
+			// Marketing names often start with the insurer name, e.g. "Blue Cross Blue Shield Gold PPO"
+			insurerName = result.Plans[0].MarketingName
+			// Trim plan-specific suffixes to get the insurer name
+			for _, suffix := range []string{" Gold", " Silver", " Bronze", " Platinum", " Catastrophic", " PPO", " HMO", " EPO", " POS"} {
+				if idx := strings.Index(insurerName, suffix); idx > 0 {
+					insurerName = insurerName[:idx]
+					break
+				}
+			}
+		}
+		ins, createErr := ing.db.Insurer.Create().
+			SetInsurerName(insurerName).
+			SetHiosIssuerID(result.Issuer.IssuerID).
+			Save(ctx)
+		if createErr != nil {
+			log.Printf("QHP: WARN: failed to create insurer for %s: %v", result.Issuer.IssuerID, createErr)
+		} else {
+			insurerEnt = ins
+		}
+	}
+
 	// Build a map of plan_id -> plan entity for this issuer
 	planMap := make(map[string]*ent.Plan)
 
@@ -166,7 +213,7 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 		segmentID := "000"
 
 		// Upsert plan
-		existing, err := ing.db.Plan.Query().
+		existingPlan, err := ing.db.Plan.Query().
 			Where(
 				plan.ContractID(contractID),
 				plan.PlanID(planID),
@@ -175,15 +222,21 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 			Only(ctx)
 
 		if ent.IsNotFound(err) {
-			planEnt, err := ing.db.Plan.Create().
+			builder := ing.db.Plan.Create().
 				SetContractID(contractID).
 				SetPlanID(planID).
 				SetSegmentID(segmentID).
 				SetContractName(result.Issuer.IssuerID).
 				SetPlanName(p.MarketingName).
 				SetFormularyID(planID).
-				SetPlanType("QHP").
-				Save(ctx)
+				SetPlanType("QHP")
+			if result.Issuer.State != "" {
+				builder = builder.SetStateCode(result.Issuer.State)
+			}
+			if insurerEnt != nil {
+				builder = builder.SetInsurerID(insurerEnt.ID)
+			}
+			planEnt, err := builder.Save(ctx)
 			if err != nil {
 				return fmt.Errorf("create plan %s: %w", planID, err)
 			}
@@ -191,7 +244,23 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 		} else if err != nil {
 			return fmt.Errorf("query plan %s: %w", planID, err)
 		} else {
-			planMap[p.PlanID] = existing
+			// Update existing plan to link insurer and state if missing
+			needsUpdate := false
+			updater := existingPlan.Update()
+			if insurerEnt != nil {
+				updater = updater.SetInsurerID(insurerEnt.ID)
+				needsUpdate = true
+			}
+			if result.Issuer.State != "" {
+				updater = updater.SetStateCode(result.Issuer.State)
+				needsUpdate = true
+			}
+			if needsUpdate {
+				if _, err := updater.Save(ctx); err != nil {
+					log.Printf("QHP: WARN: failed to update plan %s: %v", planID, err)
+				}
+			}
+			planMap[p.PlanID] = existingPlan
 		}
 	}
 

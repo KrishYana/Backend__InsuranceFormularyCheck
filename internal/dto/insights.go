@@ -6,6 +6,7 @@ type InsightsSummaryDTO struct {
 	CoverageSuccessRate float64             `json:"coverageSuccessRate"`
 	TopDrugs            []TopDrugDTO        `json:"topDrugs"`
 	TopInsurers         []TopInsurerDTO     `json:"topInsurers"`
+	TopPlans            []TopPlanDTO        `json:"topPlans"`
 }
 
 // TopDrugDTO represents a frequently searched drug.
@@ -18,6 +19,12 @@ type TopDrugDTO struct {
 type TopInsurerDTO struct {
 	Insurer     InsurerDTO `json:"insurer"`
 	SearchCount int        `json:"searchCount"`
+}
+
+// TopPlanDTO represents a frequently checked plan.
+type TopPlanDTO struct {
+	Plan        PlanDTO `json:"plan"`
+	SearchCount int     `json:"searchCount"`
 }
 
 // InsightsTrendsDTO is the response shape for GET /insights/trends.

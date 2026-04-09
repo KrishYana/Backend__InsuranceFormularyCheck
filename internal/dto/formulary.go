@@ -6,22 +6,24 @@ import (
 
 // FormularyEntryDTO matches the frontend FormularyEntry type.
 type FormularyEntryDTO struct {
-	EntryID           int      `json:"entryId"`
-	PlanID            int      `json:"planId"`
-	DrugID            int      `json:"drugId"`
-	IsCovered         bool     `json:"isCovered"`
-	TierLevel         *int     `json:"tierLevel"`
-	TierName          *string  `json:"tierName"`
-	PriorAuthRequired bool     `json:"priorAuthRequired"`
-	StepTherapy       bool     `json:"stepTherapy"`
-	QuantityLimit     bool     `json:"quantityLimit"`
+	EntryID            int      `json:"entryId"`
+	PlanID             int      `json:"planId"`
+	DrugID             int      `json:"drugId"`
+	IsCovered          bool     `json:"isCovered"`
+	TierLevel          *int     `json:"tierLevel"`
+	TierName           *string  `json:"tierName"`
+	PriorAuthRequired  bool     `json:"priorAuthRequired"`
+	StepTherapy        bool     `json:"stepTherapy"`
+	QuantityLimit      bool     `json:"quantityLimit"`
 	QuantityLimitDetail *string `json:"quantityLimitDetail"`
-	SpecialtyDrug     bool     `json:"specialtyDrug"`
-	CopayAmount       *float64 `json:"copayAmount"`
-	CoinsurancePct    *float64 `json:"coinsurancePct"`
-	CopayMailOrder    *float64 `json:"copayMailOrder"`
-	SourceType        string   `json:"sourceType"`
-	SourceDate        string   `json:"sourceDate"`
+	SpecialtyDrug      bool     `json:"specialtyDrug"`
+	CopayAmount        *float64 `json:"copayAmount"`
+	CoinsurancePct     *float64 `json:"coinsurancePct"`
+	CopayMailOrder     *float64 `json:"copayMailOrder"`
+	SourceType         string   `json:"sourceType"`
+	SourceDate         string   `json:"sourceDate"`
+	ResolvedViaGeneric bool     `json:"resolvedViaGeneric,omitempty"`
+	GenericDrugName    *string  `json:"genericDrugName,omitempty"`
 }
 
 // FormularyEntryFromEnt converts an Ent FormularyEntry to a DTO.
@@ -122,6 +124,8 @@ type DrugAlternativeDTO struct {
 	Source            *string  `json:"source"`
 	Notes             *string  `json:"notes"`
 	AlternativeDrug   *DrugDTO `json:"alternativeDrug,omitempty"`
+	CoverageStatus    *string  `json:"coverageStatus,omitempty"`
+	AlternativeTierName *string `json:"alternativeTierName,omitempty"`
 }
 
 // DrugAlternativeFromEnt converts an Ent DrugAlternative to a DTO.

@@ -9,6 +9,7 @@ import (
 	"github.com/kyanaman/formularycheck/ent"
 	"github.com/kyanaman/formularycheck/ent/drug"
 	"github.com/kyanaman/formularycheck/ent/formularyentry"
+	"github.com/kyanaman/formularycheck/ent/insurer"
 	"github.com/kyanaman/formularycheck/ent/plan"
 	"github.com/kyanaman/formularycheck/internal/synctracker"
 )
@@ -101,6 +102,40 @@ func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
 
 	log.Printf("Found %d plans. Upserting...", len(plans))
 
+	// First pass: create an Insurer for each unique contract
+	insurerMap := make(map[string]*ent.Insurer) // contractID → Insurer
+	for _, p := range plans {
+		if _, ok := insurerMap[p.ContractID]; ok {
+			continue
+		}
+
+		// Find existing insurer by contract ID stored in hios_issuer_id
+		existing, err := ing.db.Insurer.Query().
+			Where(insurer.HiosIssuerID(p.ContractID)).
+			Only(ctx)
+		if err == nil {
+			insurerMap[p.ContractID] = existing
+			continue
+		}
+		if !ent.IsNotFound(err) {
+			log.Printf("CMS PUF: WARN: error querying insurer for contract %s: %v", p.ContractID, err)
+			continue
+		}
+
+		// Create new insurer from contract info
+		ins, err := ing.db.Insurer.Create().
+			SetInsurerName(p.ContractName).
+			SetHiosIssuerID(p.ContractID).
+			Save(ctx)
+		if err != nil {
+			log.Printf("CMS PUF: WARN: failed to create insurer for contract %s: %v", p.ContractID, err)
+			continue
+		}
+		insurerMap[p.ContractID] = ins
+	}
+	log.Printf("Insurers: %d unique contracts mapped", len(insurerMap))
+
+	// Second pass: upsert plans linked to their insurer
 	var created, updated, errors int
 	for _, p := range plans {
 		existing, err := ing.db.Plan.Query().
@@ -111,8 +146,10 @@ func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
 			).
 			Only(ctx)
 
+		insurerEnt := insurerMap[p.ContractID]
+
 		if ent.IsNotFound(err) {
-			_, err = ing.db.Plan.Create().
+			builder := ing.db.Plan.Create().
 				SetContractID(p.ContractID).
 				SetPlanID(p.PlanID).
 				SetSegmentID(p.SegmentID).
@@ -120,9 +157,11 @@ func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
 				SetPlanName(p.PlanName).
 				SetFormularyID(p.FormularyID).
 				SetPlanType(p.PlanType).
-				SetSnpType(p.SNPType).
-				Save(ctx)
-			if err != nil {
+				SetSnpType(p.SNPType)
+			if insurerEnt != nil {
+				builder = builder.SetInsurerID(insurerEnt.ID)
+			}
+			if _, err = builder.Save(ctx); err != nil {
 				errors++
 				continue
 			}
@@ -131,14 +170,16 @@ func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
 			errors++
 			continue
 		} else {
-			_, err = existing.Update().
+			updater := existing.Update().
 				SetContractName(p.ContractName).
 				SetPlanName(p.PlanName).
 				SetFormularyID(p.FormularyID).
 				SetPlanType(p.PlanType).
-				SetSnpType(p.SNPType).
-				Save(ctx)
-			if err != nil {
+				SetSnpType(p.SNPType)
+			if insurerEnt != nil {
+				updater = updater.SetInsurerID(insurerEnt.ID)
+			}
+			if _, err = updater.Save(ctx); err != nil {
 				errors++
 				continue
 			}
