@@ -1,8 +1,9 @@
-package main
+package scheduler
 
 import (
 	"context"
-	"log/slog"
+	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -10,8 +11,6 @@ import (
 	"github.com/kyanaman/formularycheck/ent"
 	entarticle "github.com/kyanaman/formularycheck/ent/article"
 	"github.com/kyanaman/formularycheck/internal/summarizer"
-
-	_ "github.com/lib/pq"
 )
 
 // premiumSources are peer-reviewed journals and government agencies.
@@ -21,75 +20,11 @@ var premiumSources = map[string]bool{
 	"FDA":            true,
 	"FDA Safety":     true,
 	"PubMed":         true,
-	// Journal names that come through as sourceName from PubMed ESummary
 	"N Engl J Med":   true,
 	"JAMA":           true,
 	"Lancet":         true,
 	"BMJ":            true,
 	"Ann Intern Med": true,
-}
-
-func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})))
-
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://formulary:formulary@localhost:5432/formularycheck?sslmode=disable"
-	}
-
-	client, err := ent.Open("postgres", dsn)
-	if err != nil {
-		slog.Error("failed to connect to database", "error", err)
-		os.Exit(1)
-	}
-	defer client.Close()
-
-	ctx := context.Background()
-
-	if err := client.Schema.Create(ctx); err != nil {
-		slog.Error("failed to run migrations", "error", err)
-		os.Exit(1)
-	}
-
-	// Deactivate articles from paywalled sources that were previously ingested
-	deactivatePaywalled(ctx, client)
-
-	// Initialize summarizer
-	openaiKey := os.Getenv("OPENAI_API_KEY")
-	openaiModel := os.Getenv("OPENAI_MODEL")
-	sum := summarizer.New(openaiKey, openaiModel)
-	if sum.IsConfigured() {
-		slog.Info("summarizer configured", "model", openaiModel)
-	} else {
-		slog.Info("OPENAI_API_KEY not set — articles will be ingested without AI curation/summaries")
-	}
-
-	// Step 1: Collect candidate articles from all sources (no summarization yet)
-	candidates := collectCandidates(ctx, client, sum)
-	slog.Info("collected candidate articles", "count", len(candidates))
-
-	if len(candidates) == 0 {
-		slog.Info("no new candidates, skipping curation")
-	} else if sum.IsConfigured() {
-		// Step 2: Use GPT to curate the top 3-5 most important articles
-		curateAndIngest(ctx, client, sum, candidates)
-	} else {
-		// No LLM — just take the first 5 candidates
-		if len(candidates) > 5 {
-			candidates = candidates[:5]
-		}
-		for _, c := range candidates {
-			ingestCandidate(ctx, client, nil, c)
-		}
-		slog.Info("ingested articles without curation", "count", len(candidates))
-	}
-
-	// Step 3: Tiered retention cleanup
-	applyRetentionPolicy(ctx, client)
-
-	slog.Info("article ingestion complete")
 }
 
 // candidate holds a fetched-but-not-yet-stored article.
@@ -101,24 +36,85 @@ type candidate struct {
 	PubDate    time.Time
 }
 
+// RunArticleIngestion runs the full article pipeline: collect candidates from
+// RSS and PubMed, curate the top articles via LLM, summarize each, and store
+// to the database. Finally, it applies tiered retention cleanup.
+func RunArticleIngestion(ctx context.Context, db *ent.Client, sum *summarizer.Client) error {
+	// Step 1: Collect candidate articles from all sources
+	candidates := collectCandidates(ctx, db, sum)
+	log.Printf("scheduler: collected %d candidate articles", len(candidates))
+
+	if len(candidates) == 0 {
+		log.Println("scheduler: no new article candidates")
+		return nil
+	}
+
+	// Step 2: Curate and ingest
+	if sum != nil && sum.IsConfigured() {
+		curateAndIngest(ctx, db, sum, candidates)
+	} else {
+		// No LLM configured — take the first 5 candidates
+		if len(candidates) > 5 {
+			candidates = candidates[:5]
+		}
+		for _, c := range candidates {
+			ingestCandidate(ctx, db, nil, c)
+		}
+		log.Printf("scheduler: ingested %d articles (no curation — OPENAI_API_KEY not set)", len(candidates))
+	}
+
+	// Step 3: Tiered retention cleanup
+	applyRetentionPolicy(ctx, db)
+
+	log.Println("scheduler: article ingestion complete")
+	return nil
+}
+
+// StartArticleScheduler launches a background goroutine that runs article
+// ingestion at the given interval. It respects context cancellation for
+// graceful shutdown.
+func StartArticleScheduler(ctx context.Context, db *ent.Client, sum *summarizer.Client, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				log.Println("scheduler: starting article ingestion...")
+				ingCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+				if err := RunArticleIngestion(ingCtx, db, sum); err != nil {
+					log.Printf("scheduler: article ingestion failed: %v", err)
+				}
+				cancel()
+			case <-ctx.Done():
+				log.Println("scheduler: shutting down article scheduler")
+				return
+			}
+		}
+	}()
+}
+
+// collectCandidates gathers article candidates from all configured sources
+// (RSS feeds + PubMed) without storing them.
 func collectCandidates(ctx context.Context, db *ent.Client, sum *summarizer.Client) []candidate {
 	var all []candidate
 
-	// RSS feeds (fetch without summarizing)
+	// RSS feeds
 	rssIngestor := articles.NewRSSIngestor(db, articles.DefaultFeeds(), nil) // nil summarizer = collect only
 	rssCandidates := rssIngestor.CollectCandidates(ctx)
-	all = append(all, toCandidates(rssCandidates)...)
+	all = append(all, rawToCandidates(rssCandidates)...)
 
 	// PubMed
 	ncbiKey := os.Getenv("NCBI_API_KEY")
 	pubmedIngestor := articles.NewPubMedIngestor(db, ncbiKey, nil)
 	pmCandidates := pubmedIngestor.CollectCandidates(ctx)
-	all = append(all, toCandidates(pmCandidates)...)
+	all = append(all, rawToCandidates(pmCandidates)...)
 
 	return all
 }
 
-func toCandidates(raw []articles.RawCandidate) []candidate {
+// rawToCandidates converts articles.RawCandidate slices to local candidate structs.
+func rawToCandidates(raw []articles.RawCandidate) []candidate {
 	out := make([]candidate, len(raw))
 	for i, r := range raw {
 		out[i] = candidate{
@@ -132,6 +128,8 @@ func toCandidates(raw []articles.RawCandidate) []candidate {
 	return out
 }
 
+// curateAndIngest uses the LLM to select the top 3-5 articles from candidates,
+// then summarizes and stores each selected article.
 func curateAndIngest(ctx context.Context, db *ent.Client, sum *summarizer.Client, candidates []candidate) {
 	// Build summarizer candidates
 	sumCandidates := make([]summarizer.Candidate, len(candidates))
@@ -146,14 +144,14 @@ func curateAndIngest(ctx context.Context, db *ent.Client, sum *summarizer.Client
 
 	selected, err := sum.Curate(ctx, sumCandidates)
 	if err != nil {
-		slog.Warn("curation failed, falling back to first 5", "error", err)
+		log.Printf("scheduler: curation failed, falling back to first 5: %v", err)
 		selected = []int{}
 		for i := 0; i < len(candidates) && i < 5; i++ {
 			selected = append(selected, i)
 		}
 	}
 
-	slog.Info("curated articles", "selected", len(selected), "candidates", len(candidates))
+	log.Printf("scheduler: curated %d articles from %d candidates", len(selected), len(candidates))
 
 	// Summarize and ingest only the selected articles
 	var ingested int
@@ -165,9 +163,11 @@ func curateAndIngest(ctx context.Context, db *ent.Client, sum *summarizer.Client
 			ingested++
 		}
 	}
-	slog.Info("ingested curated articles", "count", ingested)
+	log.Printf("scheduler: ingested %d curated articles", ingested)
 }
 
+// ingestCandidate deduplicates, optionally summarizes via LLM, and stores a
+// single article candidate to the database.
 func ingestCandidate(ctx context.Context, db *ent.Client, sum *summarizer.Client, c candidate) bool {
 	// Final dedup check
 	exists, _ := db.Article.Query().
@@ -188,7 +188,7 @@ func ingestCandidate(ctx context.Context, db *ent.Client, sum *summarizer.Client
 		builder = builder.SetSummary(c.Text)
 	}
 
-	// Summarize with LLM
+	// Summarize with LLM if configured
 	if sum != nil && sum.IsConfigured() {
 		text := c.Text
 		if text == "" {
@@ -196,7 +196,7 @@ func ingestCandidate(ctx context.Context, db *ent.Client, sum *summarizer.Client
 		}
 		result, err := sum.Summarize(ctx, c.Title, text)
 		if err != nil {
-			slog.Warn("summarize failed", "title", truncate(c.Title, 50), "error", err)
+			log.Printf("scheduler: summarize failed for '%s': %v", truncate(c.Title, 50), err)
 		} else {
 			if result.Summary != "" {
 				builder = builder.SetSummary(result.Summary)
@@ -208,12 +208,15 @@ func ingestCandidate(ctx context.Context, db *ent.Client, sum *summarizer.Client
 	}
 
 	if _, err := builder.Save(ctx); err != nil {
-		slog.Error("save failed", "title", truncate(c.Title, 50), "error", err)
+		log.Printf("scheduler: save failed for '%s': %v", truncate(c.Title, 50), err)
 		return false
 	}
 	return true
 }
 
+// applyRetentionPolicy deactivates old articles using tiered retention:
+// - Standard sources: 7-day retention
+// - Premium sources (FDA, PubMed, major journals): 90-day retention
 func applyRetentionPolicy(ctx context.Context, db *ent.Client) {
 	now := time.Now()
 
@@ -223,15 +226,14 @@ func applyRetentionPolicy(ctx context.Context, db *ent.Client) {
 		Where(
 			entarticle.PublishedAtLT(weekAgo),
 			entarticle.IsActive(true),
-			// Exclude premium sources by matching standard ones
 			entarticle.SourceNameNotIn(premiumSourceList()...),
 		).
 		SetIsActive(false).
 		Save(ctx)
 	if err != nil {
-		slog.Error("standard retention cleanup failed", "error", err)
+		log.Printf("scheduler: standard retention cleanup failed: %v", err)
 	} else if standardCount > 0 {
-		slog.Info("deactivated standard articles", "count", standardCount, "older_than_days", 7)
+		log.Printf("scheduler: deactivated %d standard articles older than 7 days", standardCount)
 	}
 
 	// Premium sources: 90-day retention
@@ -245,32 +247,13 @@ func applyRetentionPolicy(ctx context.Context, db *ent.Client) {
 		SetIsActive(false).
 		Save(ctx)
 	if err != nil {
-		slog.Error("premium retention cleanup failed", "error", err)
+		log.Printf("scheduler: premium retention cleanup failed: %v", err)
 	} else if premiumCount > 0 {
-		slog.Info("deactivated premium articles", "count", premiumCount, "older_than_days", 90)
+		log.Printf("scheduler: deactivated %d premium articles older than 90 days", premiumCount)
 	}
 }
 
-// deactivatePaywalled sets is_active=false for articles from paywalled sources
-// that were ingested before those sources were removed from the feed list.
-func deactivatePaywalled(ctx context.Context, db *ent.Client) {
-	paywallSources := []string{"STAT News", "FiercePharma"}
-	count, err := db.Article.Update().
-		Where(
-			entarticle.SourceNameIn(paywallSources...),
-			entarticle.IsActive(true),
-		).
-		SetIsActive(false).
-		Save(ctx)
-	if err != nil {
-		slog.Error("failed to deactivate paywalled articles", "error", err)
-		return
-	}
-	if count > 0 {
-		slog.Info("deactivated paywalled articles", "count", count, "sources", paywallSources)
-	}
-}
-
+// premiumSourceList returns the premium source names as a slice.
 func premiumSourceList() []string {
 	list := make([]string, 0, len(premiumSources))
 	for s := range premiumSources {
@@ -279,9 +262,10 @@ func premiumSourceList() []string {
 	return list
 }
 
+// truncate shortens a string to n characters with an ellipsis suffix.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return fmt.Sprintf("%s...", s[:n])
 }

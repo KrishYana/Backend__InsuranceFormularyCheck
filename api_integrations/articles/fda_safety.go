@@ -5,7 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -39,7 +39,7 @@ type rssItem struct {
 
 // Run fetches and ingests FDA Drug Safety Communications.
 func (f *FDAIngestor) Run(ctx context.Context) error {
-	log.Println("Fetching FDA Drug Safety Communications...")
+	slog.Info("fetching FDA Drug Safety Communications")
 
 	resp, err := http.Get(fdaRSSURL)
 	if err != nil {
@@ -82,12 +82,12 @@ func (f *FDAIngestor) Run(ctx context.Context) error {
 			SetIsActive(true).
 			Save(ctx)
 		if err != nil {
-			log.Printf("Failed to create FDA article: %v", err)
+			slog.Error("failed to create FDA article", "error", err)
 			continue
 		}
 		created++
 	}
 
-	log.Printf("FDA articles: %d created, %d skipped (already exist)", created, skipped)
+	slog.Info("FDA articles ingested", "created", created, "skipped", skipped)
 	return nil
 }

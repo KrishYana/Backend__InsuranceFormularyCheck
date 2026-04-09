@@ -5,7 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -31,13 +31,42 @@ type Feed struct {
 }
 
 // DefaultFeeds returns the built-in list of medical journal/news RSS feeds.
+// Only free, publicly accessible feeds — no paywalled sources.
 func DefaultFeeds() []Feed {
 	return []Feed{
 		{Name: "FDA Safety", URL: "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/drug-safety-communications/rss.xml"},
-		{Name: "STAT News", URL: "https://www.statnews.com/feed/"},
-		{Name: "FiercePharma", URL: "https://www.fiercepharma.com/rss/xml"},
+		{Name: "FDA Drug Approvals", URL: "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/drugs-approvals-and-alerts/rss.xml"},
+		{Name: "Medpage Today", URL: "https://www.medpagetoday.com/rss/headlines.xml"},
+		{Name: "CMS Newsroom", URL: "https://www.cms.gov/newsroom/rss"},
 		{Name: "Healio Pharmacy", URL: "https://www.healio.com/rss/pharmacy"},
 	}
+}
+
+// paywallPrefixes are title prefixes that indicate paywalled content.
+var paywallPrefixes = []string{
+	"STAT+:",
+}
+
+// paywallMarkers are substrings in titles that indicate paywalled content.
+var paywallMarkers = []string{
+	"[Subscribers only]",
+	"[Premium]",
+	"[Exclusive]",
+}
+
+// isPaywalled returns true if the article title matches known paywall markers.
+func isPaywalled(title string) bool {
+	for _, prefix := range paywallPrefixes {
+		if strings.HasPrefix(title, prefix) {
+			return true
+		}
+	}
+	for _, marker := range paywallMarkers {
+		if strings.Contains(title, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // RSSIngestor fetches articles from multiple RSS feeds.
@@ -66,11 +95,20 @@ func (r *RSSIngestor) CollectCandidates(ctx context.Context) []RawCandidate {
 	for _, feed := range r.feeds {
 		candidates, err := r.fetchFeedCandidates(ctx, feed)
 		if err != nil {
-			log.Printf("RSS [%s]: failed: %v", feed.Name, err)
+			slog.Error("RSS feed collection failed", "feed", feed.Name, "error", err)
 			continue
 		}
-		all = append(all, candidates...)
-		log.Printf("RSS [%s]: %d candidates", feed.Name, len(candidates))
+		// Filter out paywalled articles
+		var free []RawCandidate
+		for _, c := range candidates {
+			if isPaywalled(c.Title) {
+				slog.Info("RSS skipping paywalled article", "feed", feed.Name, "title", truncate(c.Title, 60))
+				continue
+			}
+			free = append(free, c)
+		}
+		all = append(all, free...)
+		slog.Info("RSS feed candidates collected", "feed", feed.Name, "count", len(free), "paywalled_skipped", len(candidates)-len(free))
 	}
 
 	return all
@@ -109,6 +147,11 @@ func (r *RSSIngestor) fetchFeedCandidates(ctx context.Context, feed Feed) ([]Raw
 			continue
 		}
 
+		// Skip paywalled articles
+		if isPaywalled(item.Title) {
+			continue
+		}
+
 		// Skip if already in DB
 		exists, _ := r.db.Article.Query().
 			Where(entarticle.SourceURL(item.Link)).
@@ -136,15 +179,15 @@ func (r *RSSIngestor) Run(ctx context.Context) error {
 	for _, feed := range r.feeds {
 		created, skipped, err := r.processFeed(ctx, feed)
 		if err != nil {
-			log.Printf("RSS [%s]: failed: %v", feed.Name, err)
+			slog.Error("RSS feed processing failed", "feed", feed.Name, "error", err)
 			continue
 		}
 		totalCreated += created
 		totalSkipped += skipped
-		log.Printf("RSS [%s]: %d created, %d skipped", feed.Name, created, skipped)
+		slog.Info("RSS feed processed", "feed", feed.Name, "created", created, "skipped", skipped)
 	}
 
-	log.Printf("RSS total: %d created, %d skipped across %d feeds", totalCreated, totalSkipped, len(r.feeds))
+	slog.Info("RSS ingestion complete", "created", totalCreated, "skipped", totalSkipped, "feeds", len(r.feeds))
 	return nil
 }
 
@@ -212,7 +255,7 @@ func (r *RSSIngestor) processFeed(ctx context.Context, feed Feed) (created, skip
 			}
 			result, err := r.summarizer.Summarize(ctx, item.Title, text)
 			if err != nil {
-				log.Printf("RSS [%s]: summarize failed for '%s': %v", feed.Name, truncate(item.Title, 50), err)
+				slog.Warn("RSS summarize failed", "feed", feed.Name, "title", truncate(item.Title, 50), "error", err)
 			} else {
 				if result.Summary != "" {
 					builder = builder.SetSummary(result.Summary)
@@ -224,7 +267,7 @@ func (r *RSSIngestor) processFeed(ctx context.Context, feed Feed) (created, skip
 		}
 
 		if _, err := builder.Save(ctx); err != nil {
-			log.Printf("RSS [%s]: save failed: %v", feed.Name, err)
+			slog.Error("RSS article save failed", "feed", feed.Name, "error", err)
 			continue
 		}
 		created++

@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 
 	"github.com/kyanaman/formularycheck/api_integrations/cmspuf"
@@ -15,6 +15,10 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://formulary:formulary@localhost:5432/formularycheck?sslmode=disable"
@@ -22,7 +26,8 @@ func main() {
 
 	client, err := ent.Open("postgres", dsn)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		slog.Error("failed to connect to database", "error", err)
+		os.Exit(1)
 	}
 	defer client.Close()
 
@@ -30,41 +35,46 @@ func main() {
 
 	// Run auto-migration to create/update schema
 	if err := client.Schema.Create(ctx); err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
+		slog.Error("failed to run migrations", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Database schema ready.")
+	slog.Info("database schema ready")
 
 	// Step 1: RxNorm — populate drugs table
 	rxnormIngestor := rxnorm.NewIngestor(client)
 	if err := rxnormIngestor.Run(ctx); err != nil {
-		log.Fatalf("RxNorm ingestion failed: %v", err)
+		slog.Error("RxNorm ingestion failed", "error", err)
+		os.Exit(1)
 	}
 
 	// Step 2: openFDA — populate NDC-to-drug mappings
 	fdaIngestor := openfda.NewIngestor(client)
 	if err := fdaIngestor.Run(ctx); err != nil {
-		log.Fatalf("openFDA ingestion failed: %v", err)
+		slog.Error("openFDA ingestion failed", "error", err)
+		os.Exit(1)
 	}
 
 	// Step 3: CMS Part D PUF — populate plans and formulary entries
 	pufURL := os.Getenv("CMS_PUF_URL")
 	if pufURL == "" {
-		log.Println("SKIP: CMS_PUF_URL not set. Set it to the SPUF ZIP download URL to ingest Part D data.")
+		slog.Info("SKIP: CMS_PUF_URL not set — set it to the SPUF ZIP download URL to ingest Part D data")
 	} else {
 		pufIngestor := cmspuf.NewIngestor(client, pufURL)
 		if err := pufIngestor.Run(ctx); err != nil {
-			log.Fatalf("CMS PUF ingestion failed: %v", err)
+			slog.Error("CMS PUF ingestion failed", "error", err)
+			os.Exit(1)
 		}
 	}
 
 	// Step 4: QHP — ACA Marketplace plans and formulary entries
 	qhpURL := os.Getenv("QHP_MRPUF_URL")
 	if qhpURL == "" {
-		log.Println("SKIP: QHP_MRPUF_URL not set. Set it to the MR-PUF CSV URL to ingest QHP data.")
+		slog.Info("SKIP: QHP_MRPUF_URL not set — set it to the MR-PUF CSV URL to ingest QHP data")
 	} else {
 		qhpIngestor := qhp.NewIngestor(client, qhpURL)
 		if err := qhpIngestor.Run(ctx); err != nil {
-			log.Fatalf("QHP ingestion failed: %v", err)
+			slog.Error("QHP ingestion failed", "error", err)
+			os.Exit(1)
 		}
 	}
 }
