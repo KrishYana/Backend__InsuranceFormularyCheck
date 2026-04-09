@@ -263,11 +263,11 @@ func deactivatePaywalled(ctx context.Context, db *ent.Client) {
 		SetIsActive(false).
 		Save(ctx)
 	if err != nil {
-		log.Printf("Failed to deactivate paywalled articles: %v", err)
+		slog.Error("failed to deactivate paywalled articles", "error", err)
 		return
 	}
 	if count > 0 {
-		log.Printf("Deactivated %d articles from paywalled sources (STAT News, FiercePharma)", count)
+		slog.Info("deactivated paywalled articles", "count", count, "sources", paywallSources)
 	}
 }
 
