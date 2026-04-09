@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,12 +19,25 @@ import (
 )
 
 const (
-	concurrentCrawls = 10
-	sourceName       = "qhp"
+	defaultConcurrentCrawls = 5
+	sourceName              = "qhp"
 	// issuerStaleAfter defines how long before an issuer is re-crawled.
 	// QHP data typically updates quarterly, so 7 days is a reasonable interval.
 	issuerStaleAfter = 7 * 24 * time.Hour
+	// issuerCrawlTimeout is the max duration for crawling a single issuer.
+	issuerCrawlTimeout = 60 * time.Second
 )
+
+// concurrentCrawls returns the crawl concurrency, reading QHP_CONCURRENCY
+// from the environment with a fallback to defaultConcurrentCrawls.
+func concurrentCrawls() int {
+	if v := os.Getenv("QHP_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultConcurrentCrawls
+}
 
 // Ingestor discovers QHP issuers and ingests their formulary data.
 type Ingestor struct {
@@ -63,10 +78,11 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		return nil
 	}
 
-	log.Printf("Crawling %d issuers (%d concurrent)...", len(staleIssuers), concurrentCrawls)
+	conc := concurrentCrawls()
+	log.Printf("Crawling %d issuers (%d concurrent)...", len(staleIssuers), conc)
 
 	// Crawl stale issuers concurrently
-	results := ing.crawlAll(ctx, staleIssuers)
+	results := ing.crawlAll(ctx, staleIssuers, conc)
 
 	// Process results
 	var success, failed, crawlFailed, noPlans, noDrugs int
@@ -142,9 +158,9 @@ func (ing *Ingestor) filterStaleIssuers(ctx context.Context, issuers []Issuer) (
 	return stale, skipped
 }
 
-func (ing *Ingestor) crawlAll(ctx context.Context, issuers []Issuer) []*CrawlResult {
+func (ing *Ingestor) crawlAll(ctx context.Context, issuers []Issuer, conc int) []*CrawlResult {
 	results := make([]*CrawlResult, len(issuers))
-	sem := make(chan struct{}, concurrentCrawls)
+	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
 
 	for i, issuer := range issuers {
@@ -154,7 +170,11 @@ func (ing *Ingestor) crawlAll(ctx context.Context, issuers []Issuer) []*CrawlRes
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			results[i] = ing.crawler.CrawlIssuer(ctx, issuer)
+			// Per-issuer timeout to prevent a single slow issuer from blocking the batch
+			issuerCtx, cancel := context.WithTimeout(ctx, issuerCrawlTimeout)
+			defer cancel()
+
+			results[i] = ing.crawler.CrawlIssuer(issuerCtx, issuer)
 
 			if (i+1)%50 == 0 {
 				log.Printf("Crawl progress: %d/%d issuers", i+1, len(issuers))

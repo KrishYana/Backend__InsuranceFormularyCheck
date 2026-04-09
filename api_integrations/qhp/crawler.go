@@ -5,17 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 )
 
 const (
 	maxRetries     = 3
 	requestTimeout = 60 * time.Second
+	// hostRateLimit is the minimum interval between requests to the same host.
+	// This prevents 429 Too Many Requests errors when multiple issuers share
+	// the same CDN or hosting provider.
+	hostRateLimit = 500 * time.Millisecond
 )
 
 // Crawler fetches JSON files from individual QHP issuers.
 type Crawler struct {
-	http *http.Client
+	http        *http.Client
+	hostLimiter sync.Map // map[string]time.Time — last request time per hostname
 }
 
 // NewCrawler creates a new QHP crawler.
@@ -23,6 +30,26 @@ func NewCrawler() *Crawler {
 	return &Crawler{
 		http: &http.Client{Timeout: requestTimeout},
 	}
+}
+
+// waitForHost enforces per-host rate limiting. If a request was made to the
+// same host within hostRateLimit, it sleeps until the interval has passed.
+func (c *Crawler) waitForHost(rawURL string) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return
+	}
+	host := parsed.Host
+
+	now := time.Now()
+	if lastVal, ok := c.hostLimiter.Load(host); ok {
+		last := lastVal.(time.Time)
+		elapsed := now.Sub(last)
+		if elapsed < hostRateLimit {
+			time.Sleep(hostRateLimit - elapsed)
+		}
+	}
+	c.hostLimiter.Store(host, time.Now())
 }
 
 // CrawlResult holds the parsed data from a single issuer.
@@ -92,6 +119,9 @@ func (c *Crawler) fetchJSON(ctx context.Context, url string, target any) error {
 }
 
 func (c *Crawler) doFetch(ctx context.Context, url string, target any) error {
+	// Enforce per-host rate limiting to avoid 429 errors
+	c.waitForHost(url)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
