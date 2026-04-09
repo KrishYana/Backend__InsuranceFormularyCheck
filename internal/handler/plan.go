@@ -218,7 +218,33 @@ func (h *Handler) LookupHiosPlan(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, http.StatusOK, dto.PlanFromEnt(p))
 }
 
-// LookupGroupPlan finds a plan by group ID (future feature).
+// LookupGroupPlan finds a plan by group ID from the insurance card.
+// Accepts optional plan_id to narrow down to a specific plan within the group.
 func (h *Handler) LookupGroupPlan(w http.ResponseWriter, r *http.Request) {
-	response.NotFound(w, "Group plan lookup is not yet supported. This feature is planned for a future release.")
+	groupID := r.URL.Query().Get("group_id")
+	if groupID == "" {
+		response.BadRequest(w, "group_id is required")
+		return
+	}
+
+	query := h.db.Plan.Query().
+		Where(plan.GroupID(groupID), plan.IsActive(true)).
+		WithInsurer()
+
+	// Optional plan_id narrows to a specific plan within the group
+	if pid := r.URL.Query().Get("plan_id"); pid != "" {
+		query = query.Where(plan.PlanID(pid))
+	}
+
+	p, err := query.First(r.Context())
+	if ent.IsNotFound(err) {
+		response.NotFound(w, "No plan found with that group ID")
+		return
+	}
+	if err != nil {
+		response.InternalError(w)
+		return
+	}
+
+	response.JSON(w, http.StatusOK, dto.PlanFromEnt(p))
 }

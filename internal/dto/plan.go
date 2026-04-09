@@ -52,6 +52,7 @@ type PlanDTO struct {
 	PlanType   *string `json:"planType"`
 	MarketType *string `json:"marketType"`
 	MetalLevel *string `json:"metalLevel"`
+	GroupID    *string `json:"groupId,omitempty"`
 	PlanYear   int     `json:"planYear"`
 	IsActive   bool    `json:"isActive"`
 }
@@ -74,6 +75,9 @@ func PlanFromEnt(p *ent.Plan) PlanDTO {
 	}
 	if p.MetalLevel != "" {
 		dto.MetalLevel = &p.MetalLevel
+	}
+	if p.GroupID != "" {
+		dto.GroupID = &p.GroupID
 	}
 	if p.PlanYear != nil {
 		dto.PlanYear = *p.PlanYear

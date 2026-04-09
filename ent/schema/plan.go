@@ -40,6 +40,9 @@ func (Plan) Fields() []ent.Field {
 			Optional(),
 		field.String("metal_level").
 			Optional(),
+		field.String("group_id").
+			Optional().
+			Comment("Group number from insurance card (commercial plans)"),
 		field.Int("plan_year").
 			Optional().
 			Nillable(),
@@ -74,5 +77,6 @@ func (Plan) Indexes() []ent.Index {
 		index.Fields("formulary_id"),
 		index.Fields("state_code"),
 		index.Fields("is_active"),
+		index.Fields("group_id"),
 	}
 }
