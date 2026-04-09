@@ -5,7 +5,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -13,7 +13,7 @@ import (
 
 // DiscoverIssuers downloads the MR-PUF CSV and returns the list of issuers.
 func DiscoverIssuers(ctx context.Context, mrpufURL string) ([]Issuer, error) {
-	log.Printf("Downloading MR-PUF from %s...", mrpufURL)
+	slog.Info("downloading MR-PUF", "url", mrpufURL)
 
 	client := &http.Client{Timeout: 2 * time.Minute}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mrpufURL, nil)
@@ -94,7 +94,7 @@ func parseIssuerCSV(r io.Reader) ([]Issuer, error) {
 		})
 	}
 
-	log.Printf("Discovered %d issuers from MR-PUF", len(issuers))
+	slog.Info("discovered issuers from MR-PUF", "count", len(issuers))
 	return issuers, nil
 }
 

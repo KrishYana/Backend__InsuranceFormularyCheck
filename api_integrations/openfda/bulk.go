@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -72,20 +72,20 @@ func (b *BulkDownloader) FetchAllNDCRecords(ctx context.Context) ([]NDCRecord, e
 		return nil, fmt.Errorf("get partitions: %w", err)
 	}
 
-	log.Printf("Found %d NDC bulk download partitions", len(partitions))
+	slog.Info("found NDC bulk download partitions", "count", len(partitions))
 
 	var allRecords []NDCRecord
 	for i, p := range partitions {
-		log.Printf("Downloading partition %d/%d (%s, %d records)...", i+1, len(partitions), p.DisplayName, p.Records)
+		slog.Info("downloading partition", "partition", i+1, "total", len(partitions), "name", p.DisplayName, "records", p.Records)
 
 		records, err := b.downloadPartition(ctx, p.File)
 		if err != nil {
-			log.Printf("WARN: failed to download partition %s: %v", p.DisplayName, err)
+			slog.Warn("failed to download partition", "name", p.DisplayName, "error", err)
 			continue
 		}
 
 		allRecords = append(allRecords, records...)
-		log.Printf("Partition %d: got %d records (total so far: %d)", i+1, len(records), len(allRecords))
+		slog.Info("partition downloaded", "partition", i+1, "records", len(records), "total_so_far", len(allRecords))
 	}
 
 	return allRecords, nil

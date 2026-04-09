@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,12 +16,17 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	cfg := server.LoadConfig()
 
 	// Open database connection
 	client, err := ent.Open("postgres", cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		slog.Error("failed to connect to database", "error", err)
+		os.Exit(1)
 	}
 	defer client.Close()
 
@@ -29,9 +34,10 @@ func main() {
 	if cfg.AppEnv == "development" {
 		ctx := context.Background()
 		if err := client.Schema.Create(ctx); err != nil {
-			log.Fatalf("Failed to run migrations: %v", err)
+			slog.Error("failed to run migrations", "error", err)
+			os.Exit(1)
 		}
-		log.Println("Database schema ready.")
+		slog.Info("database schema ready")
 	}
 
 	// Create router
@@ -51,20 +57,22 @@ func main() {
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("API server starting on :%s (env=%s)", cfg.Port, cfg.AppEnv)
+		slog.Info("API server starting", "port", cfg.Port, "env", cfg.AppEnv)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
+			slog.Error("server failed", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-done
-	log.Println("Shutting down...")
+	slog.Info("shutting down")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Shutdown failed: %v", err)
+		slog.Error("shutdown failed", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Server stopped.")
+	slog.Info("server stopped")
 }
