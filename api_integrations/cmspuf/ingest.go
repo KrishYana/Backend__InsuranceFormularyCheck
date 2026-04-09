@@ -3,7 +3,7 @@ package cmspuf
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/kyanaman/formularycheck/ent"
@@ -50,13 +50,13 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 
 	fingerprint, err := ing.downloader.CheckFingerprint(ctx)
 	if err != nil {
-		log.Printf("CMS PUF: WARN: could not check file fingerprint, proceeding with full download: %v", err)
+		slog.Warn("CMS PUF could not check file fingerprint, proceeding with full download", "error", err)
 	} else if lastSync != nil && lastSync.LastEtag != "" {
 		if fingerprint == lastSync.LastEtag {
-			log.Printf("CMS PUF: file unchanged since last sync (fingerprint: %s). Skipping download.", fingerprint)
+			slog.Info("CMS PUF file unchanged since last sync, skipping download", "fingerprint", fingerprint)
 			return nil
 		}
-		log.Printf("CMS PUF: file changed (was: %s, now: %s). Downloading...", lastSync.LastEtag, fingerprint)
+		slog.Info("CMS PUF file changed, downloading", "previous", lastSync.LastEtag, "current", fingerprint)
 	}
 
 	// Download and extract
@@ -85,22 +85,22 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 	// Record sync metadata
 	etag := fingerprint
 	if err := ing.tracker.RecordSync(ctx, sourceName, totalMapped, etag, ing.pufURL); err != nil {
-		log.Printf("CMS PUF: WARN: failed to record sync metadata: %v", err)
+		slog.Warn("CMS PUF failed to record sync metadata", "error", err)
 	}
 
-	log.Println("CMS PUF ingestion complete.")
+	slog.Info("CMS PUF ingestion complete")
 	return nil
 }
 
 func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
-	log.Println("Parsing Plan Information file...")
+	slog.Info("parsing Plan Information file")
 
 	plans, err := ParsePlans(data)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Found %d plans. Upserting...", len(plans))
+	slog.Info("found plans, upserting", "count", len(plans))
 
 	// First pass: create an Insurer for each unique contract
 	insurerMap := make(map[string]*ent.Insurer) // contractID → Insurer
@@ -118,7 +118,7 @@ func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
 			continue
 		}
 		if !ent.IsNotFound(err) {
-			log.Printf("CMS PUF: WARN: error querying insurer for contract %s: %v", p.ContractID, err)
+			slog.Warn("CMS PUF error querying insurer", "contract_id", p.ContractID, "error", err)
 			continue
 		}
 
@@ -128,12 +128,12 @@ func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
 			SetHiosIssuerID(p.ContractID).
 			Save(ctx)
 		if err != nil {
-			log.Printf("CMS PUF: WARN: failed to create insurer for contract %s: %v", p.ContractID, err)
+			slog.Warn("CMS PUF failed to create insurer", "contract_id", p.ContractID, "error", err)
 			continue
 		}
 		insurerMap[p.ContractID] = ins
 	}
-	log.Printf("Insurers: %d unique contracts mapped", len(insurerMap))
+	slog.Info("insurers mapped", "unique_contracts", len(insurerMap))
 
 	// Second pass: upsert plans linked to their insurer
 	var created, updated, errors int
@@ -187,7 +187,7 @@ func (ing *Ingestor) ingestPlans(ctx context.Context, data []byte) error {
 		}
 	}
 
-	log.Printf("Plans: %d created, %d updated, %d errors", created, updated, errors)
+	slog.Info("plans upserted", "created", created, "updated", updated, "errors", errors)
 	return nil
 }
 
@@ -204,12 +204,12 @@ func (ing *Ingestor) buildFormularyPlanMap(ctx context.Context) (map[string][]in
 		result[p.FormularyID] = append(result[p.FormularyID], p.ID)
 	}
 
-	log.Printf("Built formulary-to-plan map: %d formulary IDs → %d plans", len(result), len(plans))
+	slog.Info("built formulary-to-plan map", "formulary_ids", len(result), "plans", len(plans))
 	return result, nil
 }
 
 func (ing *Ingestor) ingestFormulary(ctx context.Context, data []byte, formularyToPlan map[string][]int) (int, error) {
-	log.Println("Parsing Basic Drugs Formulary file...")
+	slog.Info("parsing Basic Drugs Formulary file")
 
 	sourceDate := time.Now()
 	var totalProcessed, mapped, noDrug, noPlan, errors int
@@ -291,8 +291,7 @@ func (ing *Ingestor) ingestFormulary(ctx context.Context, data []byte, formulary
 		}
 
 		if totalProcessed%50000 == 0 {
-			log.Printf("Progress: %d processed (%d mapped, %d no drug, %d no plan, %d errors)",
-				totalProcessed, mapped, noDrug, noPlan, errors)
+			slog.Info("CMS PUF formulary progress", "processed", totalProcessed, "mapped", mapped, "no_drug", noDrug, "no_plan", noPlan, "errors", errors)
 		}
 
 		return nil
@@ -302,7 +301,6 @@ func (ing *Ingestor) ingestFormulary(ctx context.Context, data []byte, formulary
 		return mapped, err
 	}
 
-	log.Printf("Formulary done. %d processed, %d mapped, %d no drug, %d no plan, %d errors",
-		totalProcessed, mapped, noDrug, noPlan, errors)
+	slog.Info("CMS PUF formulary done", "processed", totalProcessed, "mapped", mapped, "no_drug", noDrug, "no_plan", noPlan, "errors", errors)
 	return mapped, nil
 }

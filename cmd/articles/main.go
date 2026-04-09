@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"time"
 
@@ -30,6 +30,10 @@ var premiumSources = map[string]bool{
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://formulary:formulary@localhost:5432/formularycheck?sslmode=disable"
@@ -37,14 +41,16 @@ func main() {
 
 	client, err := ent.Open("postgres", dsn)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		slog.Error("failed to connect to database", "error", err)
+		os.Exit(1)
 	}
 	defer client.Close()
 
 	ctx := context.Background()
 
 	if err := client.Schema.Create(ctx); err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
+		slog.Error("failed to run migrations", "error", err)
+		os.Exit(1)
 	}
 
 	// Deactivate articles from paywalled sources that were previously ingested
@@ -55,17 +61,17 @@ func main() {
 	openaiModel := os.Getenv("OPENAI_MODEL")
 	sum := summarizer.New(openaiKey, openaiModel)
 	if sum.IsConfigured() {
-		log.Printf("Summarizer configured (model: %s)", openaiModel)
+		slog.Info("summarizer configured", "model", openaiModel)
 	} else {
-		log.Println("OPENAI_API_KEY not set — articles will be ingested without AI curation/summaries")
+		slog.Info("OPENAI_API_KEY not set — articles will be ingested without AI curation/summaries")
 	}
 
 	// Step 1: Collect candidate articles from all sources (no summarization yet)
 	candidates := collectCandidates(ctx, client, sum)
-	log.Printf("Collected %d candidate articles", len(candidates))
+	slog.Info("collected candidate articles", "count", len(candidates))
 
 	if len(candidates) == 0 {
-		log.Println("No new candidates. Skipping curation.")
+		slog.Info("no new candidates, skipping curation")
 	} else if sum.IsConfigured() {
 		// Step 2: Use GPT to curate the top 3-5 most important articles
 		curateAndIngest(ctx, client, sum, candidates)
@@ -77,13 +83,13 @@ func main() {
 		for _, c := range candidates {
 			ingestCandidate(ctx, client, nil, c)
 		}
-		log.Printf("Ingested %d articles (no curation — OPENAI_API_KEY not set)", len(candidates))
+		slog.Info("ingested articles without curation", "count", len(candidates))
 	}
 
 	// Step 3: Tiered retention cleanup
 	applyRetentionPolicy(ctx, client)
 
-	log.Println("Article ingestion complete.")
+	slog.Info("article ingestion complete")
 }
 
 // candidate holds a fetched-but-not-yet-stored article.
@@ -140,14 +146,14 @@ func curateAndIngest(ctx context.Context, db *ent.Client, sum *summarizer.Client
 
 	selected, err := sum.Curate(ctx, sumCandidates)
 	if err != nil {
-		log.Printf("Curation failed: %v — falling back to first 5", err)
+		slog.Warn("curation failed, falling back to first 5", "error", err)
 		selected = []int{}
 		for i := 0; i < len(candidates) && i < 5; i++ {
 			selected = append(selected, i)
 		}
 	}
 
-	log.Printf("Curated %d articles from %d candidates", len(selected), len(candidates))
+	slog.Info("curated articles", "selected", len(selected), "candidates", len(candidates))
 
 	// Summarize and ingest only the selected articles
 	var ingested int
@@ -159,7 +165,7 @@ func curateAndIngest(ctx context.Context, db *ent.Client, sum *summarizer.Client
 			ingested++
 		}
 	}
-	log.Printf("Ingested %d curated articles", ingested)
+	slog.Info("ingested curated articles", "count", ingested)
 }
 
 func ingestCandidate(ctx context.Context, db *ent.Client, sum *summarizer.Client, c candidate) bool {
@@ -190,7 +196,7 @@ func ingestCandidate(ctx context.Context, db *ent.Client, sum *summarizer.Client
 		}
 		result, err := sum.Summarize(ctx, c.Title, text)
 		if err != nil {
-			log.Printf("Summarize failed for '%s': %v", truncate(c.Title, 50), err)
+			slog.Warn("summarize failed", "title", truncate(c.Title, 50), "error", err)
 		} else {
 			if result.Summary != "" {
 				builder = builder.SetSummary(result.Summary)
@@ -202,7 +208,7 @@ func ingestCandidate(ctx context.Context, db *ent.Client, sum *summarizer.Client
 	}
 
 	if _, err := builder.Save(ctx); err != nil {
-		log.Printf("Save failed for '%s': %v", truncate(c.Title, 50), err)
+		slog.Error("save failed", "title", truncate(c.Title, 50), "error", err)
 		return false
 	}
 	return true
@@ -223,9 +229,9 @@ func applyRetentionPolicy(ctx context.Context, db *ent.Client) {
 		SetIsActive(false).
 		Save(ctx)
 	if err != nil {
-		log.Printf("Standard retention cleanup failed: %v", err)
+		slog.Error("standard retention cleanup failed", "error", err)
 	} else if standardCount > 0 {
-		log.Printf("Deactivated %d standard articles older than 7 days", standardCount)
+		slog.Info("deactivated standard articles", "count", standardCount, "older_than_days", 7)
 	}
 
 	// Premium sources: 90-day retention
@@ -239,9 +245,9 @@ func applyRetentionPolicy(ctx context.Context, db *ent.Client) {
 		SetIsActive(false).
 		Save(ctx)
 	if err != nil {
-		log.Printf("Premium retention cleanup failed: %v", err)
+		slog.Error("premium retention cleanup failed", "error", err)
 	} else if premiumCount > 0 {
-		log.Printf("Deactivated %d premium articles older than 90 days", premiumCount)
+		slog.Info("deactivated premium articles", "count", premiumCount, "older_than_days", 90)
 	}
 }
 

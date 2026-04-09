@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -46,19 +46,19 @@ func (p *PubMedIngestor) CollectCandidates(ctx context.Context) []RawCandidate {
 	for _, query := range queries {
 		ids, err := p.search(ctx, query)
 		if err != nil {
-			log.Printf("PubMed search failed for '%s': %v", query, err)
+			slog.Error("PubMed search failed", "query", query, "error", err)
 			continue
 		}
 
 		candidates, err := p.fetchCandidates(ctx, ids)
 		if err != nil {
-			log.Printf("PubMed fetch candidates failed: %v", err)
+			slog.Error("PubMed fetch candidates failed", "error", err)
 			continue
 		}
 		all = append(all, candidates...)
 	}
 
-	log.Printf("PubMed: %d candidates collected", len(all))
+	slog.Info("PubMed candidates collected", "count", len(all))
 	return all
 }
 
@@ -143,7 +143,7 @@ func (p *PubMedIngestor) fetchCandidates(ctx context.Context, ids []string) ([]R
 
 // Run fetches recent PubMed articles about formulary and drug coverage.
 func (p *PubMedIngestor) Run(ctx context.Context) error {
-	log.Println("Fetching PubMed articles...")
+	slog.Info("fetching PubMed articles")
 
 	queries := []string{
 		"drug formulary coverage policy",
@@ -157,20 +157,20 @@ func (p *PubMedIngestor) Run(ctx context.Context) error {
 	for _, query := range queries {
 		ids, err := p.search(ctx, query)
 		if err != nil {
-			log.Printf("PubMed search failed for '%s': %v", query, err)
+			slog.Error("PubMed search failed", "query", query, "error", err)
 			continue
 		}
 
 		created, skipped, err := p.fetchAndStore(ctx, ids)
 		if err != nil {
-			log.Printf("PubMed fetch failed: %v", err)
+			slog.Error("PubMed fetch failed", "error", err)
 			continue
 		}
 		totalCreated += created
 		totalSkipped += skipped
 	}
 
-	log.Printf("PubMed articles: %d created, %d skipped", totalCreated, totalSkipped)
+	slog.Info("PubMed articles ingested", "created", totalCreated, "skipped", totalSkipped)
 	return nil
 }
 
@@ -285,7 +285,7 @@ func (p *PubMedIngestor) fetchAndStore(ctx context.Context, ids []string) (creat
 		if p.summarizer != nil && p.summarizer.IsConfigured() {
 			res, sumErr := p.summarizer.Summarize(ctx, summary.Title, summary.Title)
 			if sumErr != nil {
-				log.Printf("PubMed: summarize failed for PMID %s: %v", id, sumErr)
+				slog.Warn("PubMed summarize failed", "pmid", id, "error", sumErr)
 			} else {
 				if res.Summary != "" {
 					builder = builder.SetSummary(res.Summary)
@@ -297,7 +297,7 @@ func (p *PubMedIngestor) fetchAndStore(ctx context.Context, ids []string) (creat
 		}
 
 		if _, saveErr := builder.Save(ctx); saveErr != nil {
-			log.Printf("PubMed: save failed for PMID %s: %v", id, saveErr)
+			slog.Error("PubMed save failed", "pmid", id, "error", saveErr)
 			continue
 		}
 		created++

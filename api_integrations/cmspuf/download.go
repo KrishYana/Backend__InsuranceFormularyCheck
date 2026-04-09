@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -77,7 +77,7 @@ func (d *Downloader) CheckFingerprint(ctx context.Context) (string, error) {
 
 // Download fetches the PUF ZIP and extracts only the target inner ZIPs.
 func (d *Downloader) Download(ctx context.Context) (*ExtractedFiles, error) {
-	log.Printf("Downloading PUF from %s...", d.url)
+	slog.Info("downloading PUF", "url", d.url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
 	if err != nil {
@@ -99,7 +99,7 @@ func (d *Downloader) Download(ctx context.Context) (*ExtractedFiles, error) {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	log.Printf("Downloaded %d MB. Extracting target files...", len(body)/(1024*1024))
+	slog.Info("downloaded PUF, extracting target files", "size_mb", len(body)/(1024*1024))
 
 	return d.extractTargetFiles(body)
 }
@@ -134,7 +134,7 @@ func (d *Downloader) extractTargetFiles(data []byte) (*ExtractedFiles, error) {
 			continue
 		}
 
-		log.Printf("Extracting: %s", f.Name)
+		slog.Info("extracting file", "name", f.Name)
 
 		content, err := extractInnerZip(f)
 		if err != nil {

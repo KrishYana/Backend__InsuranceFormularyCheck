@@ -3,7 +3,7 @@ package rxnorm
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -50,19 +50,19 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 
 	if lastSync == nil {
 		// First run: full load
-		log.Println("RxNorm: no prior sync found. Performing full ingestion...")
+		slog.Info("RxNorm: no prior sync found, performing full ingestion")
 		totalIngested, err = ing.fullLoad(ctx)
 		if err != nil {
 			return err
 		}
 	} else {
 		// Incremental run
-		log.Printf("RxNorm: last sync at %s. Running incremental update...", lastSync.LastSyncAt.Format(time.RFC3339))
+		slog.Info("RxNorm incremental update", "last_sync", lastSync.LastSyncAt.Format(time.RFC3339))
 
 		// Step 1: Fetch concepts added since last sync
 		newCount, err := ing.ingestNewConcepts(ctx, lastSync.LastSyncAt)
 		if err != nil {
-			log.Printf("RxNorm: WARN: getNewConcepts failed, will still refresh stale: %v", err)
+			slog.Warn("RxNorm getNewConcepts failed, will still refresh stale", "error", err)
 		} else {
 			totalIngested += newCount
 		}
@@ -70,47 +70,47 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		// Step 2: Refresh stale drug records
 		staleCount, err := ing.refreshStaleDrugs(ctx)
 		if err != nil {
-			log.Printf("RxNorm: WARN: stale drug refresh had errors: %v", err)
+			slog.Warn("RxNorm stale drug refresh had errors", "error", err)
 		}
 		totalIngested += staleCount
 	}
 
 	// Record this sync
 	if err := ing.tracker.RecordSync(ctx, sourceName, totalIngested, "", ""); err != nil {
-		log.Printf("RxNorm: WARN: failed to record sync metadata: %v", err)
+		slog.Warn("RxNorm failed to record sync metadata", "error", err)
 	}
 
-	log.Printf("RxNorm: sync complete. %d records processed.", totalIngested)
+	slog.Info("RxNorm sync complete", "records_processed", totalIngested)
 	return nil
 }
 
 // fullLoad fetches all SCD+SBD concepts from RxNorm (first-time ingestion).
 func (ing *Ingestor) fullLoad(ctx context.Context) (int, error) {
-	log.Println("Fetching all drug concepts from RxNorm (SCD+SBD)...")
+	slog.Info("fetching all drug concepts from RxNorm", "types", "SCD+SBD")
 
 	concepts, err := ing.client.GetAllConcepts(ctx, "SCD+SBD")
 	if err != nil {
 		return 0, fmt.Errorf("fetch concepts: %w", err)
 	}
 
-	log.Printf("Found %d drug concepts. Beginning ingestion...", len(concepts))
+	slog.Info("found drug concepts, beginning ingestion", "count", len(concepts))
 
 	var ingested, errors int
 
 	for i, concept := range concepts {
 		if err := ing.upsertDrug(ctx, concept); err != nil {
-			log.Printf("WARN: skipping %s (%s): %v", concept.RxCUI, concept.Name, err)
+			slog.Warn("RxNorm skipping concept", "rxcui", concept.RxCUI, "name", concept.Name, "error", err)
 			errors++
 			continue
 		}
 
 		ingested++
 		if (i+1)%500 == 0 {
-			log.Printf("Progress: %d/%d processed (%d ingested, %d errors)", i+1, len(concepts), ingested, errors)
+			slog.Info("RxNorm full load progress", "processed", i+1, "total", len(concepts), "ingested", ingested, "errors", errors)
 		}
 	}
 
-	log.Printf("Full load done. %d ingested, %d errors out of %d total.", ingested, errors, len(concepts))
+	slog.Info("RxNorm full load done", "ingested", ingested, "errors", errors, "total", len(concepts))
 	return ingested, nil
 }
 
@@ -118,7 +118,7 @@ func (ing *Ingestor) fullLoad(ctx context.Context) (int, error) {
 // Uses RxNorm's /REST/newConcepts.json endpoint which returns concepts added
 // since a specified date (format: MMDDYYYY).
 func (ing *Ingestor) ingestNewConcepts(ctx context.Context, since time.Time) (int, error) {
-	log.Printf("RxNorm: fetching new concepts since %s...", since.Format("2006-01-02"))
+	slog.Info("RxNorm fetching new concepts", "since", since.Format("2006-01-02"))
 
 	concepts, err := ing.client.GetNewConcepts(ctx, since)
 	if err != nil {
@@ -126,11 +126,11 @@ func (ing *Ingestor) ingestNewConcepts(ctx context.Context, since time.Time) (in
 	}
 
 	if len(concepts) == 0 {
-		log.Println("RxNorm: no new concepts found since last sync.")
+		slog.Info("RxNorm: no new concepts found since last sync")
 		return 0, nil
 	}
 
-	log.Printf("RxNorm: found %d new concepts. Ingesting...", len(concepts))
+	slog.Info("RxNorm found new concepts, ingesting", "count", len(concepts))
 
 	var ingested, errors int
 	for _, concept := range concepts {
@@ -140,14 +140,14 @@ func (ing *Ingestor) ingestNewConcepts(ctx context.Context, since time.Time) (in
 		}
 
 		if err := ing.upsertDrug(ctx, concept); err != nil {
-			log.Printf("WARN: skipping new concept %s (%s): %v", concept.RxCUI, concept.Name, err)
+			slog.Warn("RxNorm skipping new concept", "rxcui", concept.RxCUI, "name", concept.Name, "error", err)
 			errors++
 			continue
 		}
 		ingested++
 	}
 
-	log.Printf("RxNorm: %d new concepts ingested, %d errors.", ingested, errors)
+	slog.Info("RxNorm new concepts ingested", "ingested", ingested, "errors", errors)
 	return ingested, nil
 }
 
@@ -164,11 +164,11 @@ func (ing *Ingestor) refreshStaleDrugs(ctx context.Context) (int, error) {
 	}
 
 	if len(staleDrugs) == 0 {
-		log.Println("RxNorm: no stale drugs to refresh.")
+		slog.Info("RxNorm: no stale drugs to refresh")
 		return 0, nil
 	}
 
-	log.Printf("RxNorm: refreshing %d stale drugs (last synced before %s)...", len(staleDrugs), staleThreshold.Format("2006-01-02"))
+	slog.Info("RxNorm refreshing stale drugs", "count", len(staleDrugs), "threshold", staleThreshold.Format("2006-01-02"))
 
 	var refreshed, errors int
 	for i, d := range staleDrugs {
@@ -185,11 +185,11 @@ func (ing *Ingestor) refreshStaleDrugs(ctx context.Context) (int, error) {
 		refreshed++
 
 		if (i+1)%200 == 0 {
-			log.Printf("RxNorm: stale refresh progress: %d/%d", i+1, len(staleDrugs))
+			slog.Info("RxNorm stale refresh progress", "completed", i+1, "total", len(staleDrugs))
 		}
 	}
 
-	log.Printf("RxNorm: %d stale drugs refreshed, %d errors.", refreshed, errors)
+	slog.Info("RxNorm stale drugs refreshed", "refreshed", refreshed, "errors", errors)
 	return refreshed, nil
 }
 

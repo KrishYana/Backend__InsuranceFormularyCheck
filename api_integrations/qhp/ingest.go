@@ -3,7 +3,7 @@ package qhp
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -70,16 +70,16 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 	staleIssuers, skippedCount := ing.filterStaleIssuers(ctx, issuers)
 
 	if skippedCount > 0 {
-		log.Printf("QHP: %d issuers recently synced (skipped). %d stale issuers to crawl.", skippedCount, len(staleIssuers))
+		slog.Info("QHP issuers filtered", "skipped", skippedCount, "stale", len(staleIssuers))
 	}
 
 	if len(staleIssuers) == 0 {
-		log.Println("QHP: all issuers are up to date. Nothing to crawl.")
+		slog.Info("QHP: all issuers are up to date, nothing to crawl")
 		return nil
 	}
 
 	conc := concurrentCrawls()
-	log.Printf("Crawling %d issuers (%d concurrent)...", len(staleIssuers), conc)
+	slog.Info("crawling QHP issuers", "count", len(staleIssuers), "concurrency", conc)
 
 	// Crawl stale issuers concurrently
 	results := ing.crawlAll(ctx, staleIssuers, conc)
@@ -90,7 +90,7 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		if result.Err != nil {
 			crawlFailed++
 			if crawlFailed <= 10 {
-				log.Printf("CRAWL FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, result.Err)
+				slog.Error("QHP crawl failed", "state", result.Issuer.State, "issuer_id", result.Issuer.IssuerID, "error", result.Err)
 			}
 			failed++
 			continue
@@ -101,12 +101,11 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 			continue
 		}
 
-		log.Printf("  PROCESS [%s] %s: %d plans, %d drugs",
-			result.Issuer.State, result.Issuer.IssuerID, len(result.Plans), len(result.Drugs))
+		slog.Info("QHP processing issuer", "state", result.Issuer.State, "issuer_id", result.Issuer.IssuerID, "plans", len(result.Plans), "drugs", len(result.Drugs))
 
 		if err := ing.processResult(ctx, result); err != nil {
 			failed++
-			log.Printf("PROCESS FAIL [%s] %s: %v", result.Issuer.State, result.Issuer.IssuerID, err)
+			slog.Error("QHP processing failed", "state", result.Issuer.State, "issuer_id", result.Issuer.IssuerID, "error", err)
 			continue
 		}
 
@@ -118,7 +117,7 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		issuerSource := "qhp:" + result.Issuer.IssuerID
 		drugCount := len(result.Drugs)
 		if err := ing.tracker.RecordSync(ctx, issuerSource, drugCount, "", result.Issuer.URL); err != nil {
-			log.Printf("QHP: WARN: failed to record sync for issuer %s: %v", result.Issuer.IssuerID, err)
+			slog.Warn("QHP failed to record sync for issuer", "issuer_id", result.Issuer.IssuerID, "error", err)
 		}
 
 		success++
@@ -126,11 +125,17 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 
 	// Record overall QHP sync
 	if err := ing.tracker.RecordSync(ctx, sourceName, success, "", ing.mrpufURL); err != nil {
-		log.Printf("QHP: WARN: failed to record overall sync metadata: %v", err)
+		slog.Warn("QHP failed to record overall sync metadata", "error", err)
 	}
 
-	log.Printf("QHP ingestion complete. %d success, %d failed (%d crawl errors, %d no plans, %d no drugs) out of %d issuers.",
-		success, failed, crawlFailed, noPlans, noDrugs, len(staleIssuers))
+	slog.Info("QHP ingestion complete",
+		"success", success,
+		"failed", failed,
+		"crawl_errors", crawlFailed,
+		"no_plans", noPlans,
+		"no_drugs", noDrugs,
+		"total_issuers", len(staleIssuers),
+	)
 	return nil
 }
 
@@ -177,7 +182,7 @@ func (ing *Ingestor) crawlAll(ctx context.Context, issuers []Issuer, conc int) [
 			results[i] = ing.crawler.CrawlIssuer(issuerCtx, issuer)
 
 			if (i+1)%50 == 0 {
-				log.Printf("Crawl progress: %d/%d issuers", i+1, len(issuers))
+				slog.Info("QHP crawl progress", "completed", i+1, "total", len(issuers))
 			}
 		}(i, issuer)
 	}
@@ -213,7 +218,7 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 			SetHiosIssuerID(result.Issuer.IssuerID).
 			Save(ctx)
 		if createErr != nil {
-			log.Printf("QHP: WARN: failed to create insurer for %s: %v", result.Issuer.IssuerID, createErr)
+			slog.Warn("QHP failed to create insurer", "issuer_id", result.Issuer.IssuerID, "error", createErr)
 		} else {
 			insurerEnt = ins
 		}
@@ -277,7 +282,7 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 			}
 			if needsUpdate {
 				if _, err := updater.Save(ctx); err != nil {
-					log.Printf("QHP: WARN: failed to update plan %s: %v", planID, err)
+					slog.Warn("QHP failed to update plan", "plan_id", planID, "error", err)
 				}
 			}
 			planMap[p.PlanID] = existingPlan
@@ -348,8 +353,7 @@ func (ing *Ingestor) processResult(ctx context.Context, result *CrawlResult) err
 	}
 
 	if len(result.Drugs) > 0 {
-		log.Printf("  [%s] %s: %d drugs mapped, %d no match (from %d plans, %d drugs)",
-			result.Issuer.State, result.Issuer.IssuerID, mapped, noDrug, len(result.Plans), len(result.Drugs))
+		slog.Info("QHP drugs mapped", "state", result.Issuer.State, "issuer_id", result.Issuer.IssuerID, "mapped", mapped, "no_match", noDrug, "plans", len(result.Plans), "drugs", len(result.Drugs))
 	}
 
 	return nil

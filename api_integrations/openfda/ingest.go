@@ -3,7 +3,7 @@ package openfda
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -43,24 +43,24 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 
 	lastModified, err := ing.downloader.CheckLastModified(ctx)
 	if err != nil {
-		log.Printf("openFDA: WARN: could not check last-modified, proceeding with full download: %v", err)
+		slog.Warn("openFDA could not check last-modified, proceeding with full download", "error", err)
 	} else if lastSync != nil && lastSync.LastEtag != "" {
 		// Compare stored last-modified with current
 		if lastModified == lastSync.LastEtag {
-			log.Printf("openFDA: bulk data unchanged since last sync (Last-Modified: %s). Skipping download.", lastModified)
+			slog.Info("openFDA bulk data unchanged since last sync, skipping download", "last_modified", lastModified)
 			return nil
 		}
-		log.Printf("openFDA: data changed (was: %s, now: %s). Downloading...", lastSync.LastEtag, lastModified)
+		slog.Info("openFDA data changed, downloading", "previous", lastSync.LastEtag, "current", lastModified)
 	}
 
-	log.Println("Starting openFDA NDC bulk download...")
+	slog.Info("starting openFDA NDC bulk download")
 
 	records, err := ing.downloader.FetchAllNDCRecords(ctx)
 	if err != nil {
 		return fmt.Errorf("bulk download: %w", err)
 	}
 
-	log.Printf("Downloaded %d NDC records. Mapping to drugs...", len(records))
+	slog.Info("downloaded NDC records, mapping to drugs", "count", len(records))
 
 	var mapped, updated, noRxCUI, noDrug, errors int
 
@@ -75,7 +75,7 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 			default:
 				errors++
 				if errors <= 10 {
-					log.Printf("WARN: %v", err)
+					slog.Warn("openFDA record processing error", "error", err)
 				}
 			}
 			continue
@@ -89,18 +89,16 @@ func (ing *Ingestor) Run(ctx context.Context) error {
 		}
 
 		if (i+1)%5000 == 0 {
-			log.Printf("Progress: %d/%d processed (%d mapped, %d updated, %d no rxcui, %d no drug match, %d errors)",
-				i+1, len(records), mapped, updated, noRxCUI, noDrug, errors)
+			slog.Info("openFDA progress", "processed", i+1, "total", len(records), "mapped", mapped, "updated", updated, "no_rxcui", noRxCUI, "no_drug", noDrug, "errors", errors)
 		}
 	}
 
-	log.Printf("Done. %d mapped, %d updated, %d no rxcui, %d no drug match, %d errors out of %d total.",
-		mapped, updated, noRxCUI, noDrug, errors, len(records))
+	slog.Info("openFDA ingestion done", "mapped", mapped, "updated", updated, "no_rxcui", noRxCUI, "no_drug", noDrug, "errors", errors, "total", len(records))
 
 	// Record sync metadata
 	etag := lastModified
 	if err := ing.tracker.RecordSync(ctx, sourceName, mapped+updated, etag, bulkDownloadURL); err != nil {
-		log.Printf("openFDA: WARN: failed to record sync metadata: %v", err)
+		slog.Warn("openFDA failed to record sync metadata", "error", err)
 	}
 
 	return nil
