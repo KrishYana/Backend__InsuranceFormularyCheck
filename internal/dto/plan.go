@@ -35,6 +35,14 @@ func InsurerFromEnt(i *ent.Insurer, planCount *int) InsurerDTO {
 	return dto
 }
 
+// StateSectionedInsurersDTO groups insurers into local (state-specific) and
+// national (Medicare Part D / no state code) buckets for frontend consumption.
+type StateSectionedInsurersDTO struct {
+	StateCode        string       `json:"stateCode"`
+	LocalInsurers    []InsurerDTO `json:"localInsurers"`
+	NationalInsurers []InsurerDTO `json:"nationalInsurers"`
+}
+
 // PlanDTO matches the frontend Plan type.
 type PlanDTO struct {
 	PlanID     int     `json:"planId"`

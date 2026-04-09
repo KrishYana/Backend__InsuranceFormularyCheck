@@ -47,6 +47,9 @@ func main() {
 		log.Fatalf("Failed to run migrations: %v", err)
 	}
 
+	// Deactivate articles from paywalled sources that were previously ingested
+	deactivatePaywalled(ctx, client)
+
 	// Initialize summarizer
 	openaiKey := os.Getenv("OPENAI_API_KEY")
 	openaiModel := os.Getenv("OPENAI_MODEL")
@@ -239,6 +242,26 @@ func applyRetentionPolicy(ctx context.Context, db *ent.Client) {
 		log.Printf("Premium retention cleanup failed: %v", err)
 	} else if premiumCount > 0 {
 		log.Printf("Deactivated %d premium articles older than 90 days", premiumCount)
+	}
+}
+
+// deactivatePaywalled sets is_active=false for articles from paywalled sources
+// that were ingested before those sources were removed from the feed list.
+func deactivatePaywalled(ctx context.Context, db *ent.Client) {
+	paywallSources := []string{"STAT News", "FiercePharma"}
+	count, err := db.Article.Update().
+		Where(
+			entarticle.SourceNameIn(paywallSources...),
+			entarticle.IsActive(true),
+		).
+		SetIsActive(false).
+		Save(ctx)
+	if err != nil {
+		log.Printf("Failed to deactivate paywalled articles: %v", err)
+		return
+	}
+	if count > 0 {
+		log.Printf("Deactivated %d articles from paywalled sources (STAT News, FiercePharma)", count)
 	}
 }
 

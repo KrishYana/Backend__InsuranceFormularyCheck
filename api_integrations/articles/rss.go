@@ -31,13 +31,42 @@ type Feed struct {
 }
 
 // DefaultFeeds returns the built-in list of medical journal/news RSS feeds.
+// Only free, publicly accessible feeds — no paywalled sources.
 func DefaultFeeds() []Feed {
 	return []Feed{
 		{Name: "FDA Safety", URL: "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/drug-safety-communications/rss.xml"},
-		{Name: "STAT News", URL: "https://www.statnews.com/feed/"},
-		{Name: "FiercePharma", URL: "https://www.fiercepharma.com/rss/xml"},
+		{Name: "FDA Drug Approvals", URL: "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/drugs-approvals-and-alerts/rss.xml"},
+		{Name: "Medpage Today", URL: "https://www.medpagetoday.com/rss/headlines.xml"},
+		{Name: "CMS Newsroom", URL: "https://www.cms.gov/newsroom/rss"},
 		{Name: "Healio Pharmacy", URL: "https://www.healio.com/rss/pharmacy"},
 	}
+}
+
+// paywallPrefixes are title prefixes that indicate paywalled content.
+var paywallPrefixes = []string{
+	"STAT+:",
+}
+
+// paywallMarkers are substrings in titles that indicate paywalled content.
+var paywallMarkers = []string{
+	"[Subscribers only]",
+	"[Premium]",
+	"[Exclusive]",
+}
+
+// isPaywalled returns true if the article title matches known paywall markers.
+func isPaywalled(title string) bool {
+	for _, prefix := range paywallPrefixes {
+		if strings.HasPrefix(title, prefix) {
+			return true
+		}
+	}
+	for _, marker := range paywallMarkers {
+		if strings.Contains(title, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // RSSIngestor fetches articles from multiple RSS feeds.
@@ -69,8 +98,17 @@ func (r *RSSIngestor) CollectCandidates(ctx context.Context) []RawCandidate {
 			log.Printf("RSS [%s]: failed: %v", feed.Name, err)
 			continue
 		}
-		all = append(all, candidates...)
-		log.Printf("RSS [%s]: %d candidates", feed.Name, len(candidates))
+		// Filter out paywalled articles
+		var free []RawCandidate
+		for _, c := range candidates {
+			if isPaywalled(c.Title) {
+				log.Printf("RSS [%s]: skipping paywalled article: %s", feed.Name, truncate(c.Title, 60))
+				continue
+			}
+			free = append(free, c)
+		}
+		all = append(all, free...)
+		log.Printf("RSS [%s]: %d candidates (%d paywalled skipped)", feed.Name, len(free), len(candidates)-len(free))
 	}
 
 	return all
@@ -106,6 +144,11 @@ func (r *RSSIngestor) fetchFeedCandidates(ctx context.Context, feed Feed) ([]Raw
 	var candidates []RawCandidate
 	for _, item := range items {
 		if item.Link == "" || item.Title == "" {
+			continue
+		}
+
+		// Skip paywalled articles
+		if isPaywalled(item.Title) {
 			continue
 		}
 
