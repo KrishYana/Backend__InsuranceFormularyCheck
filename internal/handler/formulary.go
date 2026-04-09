@@ -71,7 +71,16 @@ func (h *Handler) GetCoverage(w http.ResponseWriter, r *http.Request) {
 		Only(r.Context())
 
 	if ent.IsNotFound(err) {
-		// Return synthetic not-covered response
+		// Try generic fallback: look up the branded drug's generic equivalent
+		genericEntry := h.resolveViaGeneric(r.Context(), planID, drugID)
+		if genericEntry != nil {
+			// Record search history even for generic-resolved lookups
+			h.recordSearchHistory(r, "", 1, &planID, &drugID)
+			response.JSON(w, http.StatusOK, *genericEntry)
+			return
+		}
+
+		// No coverage found even via generic
 		response.JSON(w, http.StatusOK, dto.FormularyEntryDTO{
 			PlanID:    planID,
 			DrugID:    drugID,
@@ -143,29 +152,153 @@ func (h *Handler) GetCoverageMulti(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetAlternatives handles GET /drugs/{id}/alternatives?plan_id=N.
+// Dynamically generates generic equivalents from drug data in addition
+// to any pre-populated DrugAlternative records.
 func (h *Handler) GetAlternatives(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	drugID, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
 		response.BadRequest(w, "Invalid drug ID")
 		return
 	}
 
+	// Optional plan_id for coverage status on alternatives
+	var planID int
+	if pidStr := r.URL.Query().Get("plan_id"); pidStr != "" {
+		planID, _ = strconv.Atoi(pidStr)
+	}
+
+	// 1. Get pre-populated alternatives from DB
 	alternatives, err := h.db.DrugAlternative.Query().
 		Where(drugalternative.HasDrugWith(drug.ID(drugID))).
 		WithDrug().
 		WithAlternativeDrug().
-		All(r.Context())
+		All(ctx)
 	if err != nil {
 		response.InternalError(w)
 		return
 	}
 
-	result := make([]dto.DrugAlternativeDTO, len(alternatives))
-	for i, a := range alternatives {
-		result[i] = dto.DrugAlternativeFromEnt(a)
+	result := make([]dto.DrugAlternativeDTO, 0, len(alternatives)+5)
+
+	// 2. Dynamically find generic equivalents via generic_name matching
+	requestedDrug, err := h.db.Drug.Get(ctx, drugID)
+	if err == nil && requestedDrug.GenericName != "" {
+		// Find drugs that share the same generic_name (generic ↔ brand siblings)
+		genericSiblings, err := h.db.Drug.Query().
+			Where(
+				drug.Or(
+					drug.DrugName(requestedDrug.GenericName),
+					drug.GenericName(requestedDrug.GenericName),
+				),
+				drug.IDNEQ(drugID),
+			).
+			All(ctx)
+		if err == nil {
+			for _, g := range genericSiblings {
+				altDTO := dto.DrugAlternativeDTO{
+					DrugID:            drugID,
+					AlternativeDrugID: g.ID,
+					RelationshipType:  "GENERIC_EQUIVALENT",
+				}
+				src := "RxNorm"
+				altDTO.Source = &src
+				gDTO := dto.DrugFromEnt(g)
+				altDTO.AlternativeDrug = &gDTO
+
+				// Check coverage if plan_id provided
+				if planID > 0 {
+					altDTO.CoverageStatus, altDTO.AlternativeTierName = h.checkAlternativeCoverage(ctx, planID, g.ID)
+				}
+
+				result = append(result, altDTO)
+			}
+		}
+	}
+
+	// 3. Append pre-populated alternatives with coverage status
+	for _, a := range alternatives {
+		altDTO := dto.DrugAlternativeFromEnt(a)
+		if planID > 0 && a.Edges.AlternativeDrug != nil {
+			altDTO.CoverageStatus, altDTO.AlternativeTierName = h.checkAlternativeCoverage(ctx, planID, a.Edges.AlternativeDrug.ID)
+		}
+		result = append(result, altDTO)
 	}
 
 	response.JSON(w, http.StatusOK, result)
+}
+
+// resolveViaGeneric attempts to find coverage for the generic equivalent
+// of a branded drug. Returns nil if no generic match or no coverage found.
+func (h *Handler) resolveViaGeneric(ctx context.Context, planID, brandedDrugID int) *dto.FormularyEntryDTO {
+	// Look up the branded drug
+	brandedDrug, err := h.db.Drug.Get(ctx, brandedDrugID)
+	if err != nil || brandedDrug.GenericName == "" {
+		return nil
+	}
+
+	// If drug_name == generic_name, this IS the generic — no fallback needed
+	if brandedDrug.DrugName == brandedDrug.GenericName {
+		return nil
+	}
+
+	// Find the generic drug by matching drug_name to the branded drug's generic_name
+	genericDrug, err := h.db.Drug.Query().
+		Where(
+			drug.DrugName(brandedDrug.GenericName),
+			drug.IDNEQ(brandedDrugID),
+		).
+		First(ctx)
+	if err != nil {
+		return nil
+	}
+
+	// Check if the generic drug is covered on this plan
+	entry, err := h.db.FormularyEntry.Query().
+		Where(
+			formularyentry.HasPlanWith(plan.ID(planID)),
+			formularyentry.HasDrugWith(drug.ID(genericDrug.ID)),
+			formularyentry.IsCurrent(true),
+		).
+		WithPlan().
+		WithDrug().
+		Only(ctx)
+	if err != nil {
+		return nil
+	}
+
+	// Build DTO with the generic resolution flag
+	result := dto.FormularyEntryFromEnt(entry)
+	result.DrugID = brandedDrugID // Keep original drug ID for the physician's context
+	result.ResolvedViaGeneric = true
+	gn := genericDrug.DrugName
+	result.GenericDrugName = &gn
+	return &result
+}
+
+// checkAlternativeCoverage checks if a drug is covered on a plan and returns status + tier.
+func (h *Handler) checkAlternativeCoverage(ctx context.Context, planID, altDrugID int) (*string, *string) {
+	entry, err := h.db.FormularyEntry.Query().
+		Where(
+			formularyentry.HasPlanWith(plan.ID(planID)),
+			formularyentry.HasDrugWith(drug.ID(altDrugID)),
+			formularyentry.IsCurrent(true),
+		).
+		Only(ctx)
+	if err != nil {
+		status := "not_covered"
+		return &status, nil
+	}
+	if entry.IsCovered {
+		status := "covered"
+		var tier *string
+		if entry.TierName != "" {
+			tier = &entry.TierName
+		}
+		return &status, tier
+	}
+	status := "not_covered"
+	return &status, nil
 }
 
 // GetPriorAuthCriteria handles GET /coverage/{entryId}/prior-auth.
